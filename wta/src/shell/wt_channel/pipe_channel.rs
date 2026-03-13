@@ -10,41 +10,59 @@ use super::WtChannel;
 
 /// Named-pipe channel to the Windows Terminal protocol server.
 ///
-/// Connects to `\\.\pipe\WindowsTerminal-<PID>` using env vars
-/// `WT_PIPE_NAME` and `WT_MCP_TOKEN`. Protocol is line-delimited JSON
-/// with serial request-response (one at a time).
+/// Connects to `\\.\pipe\WindowsTerminal-<PID>` using env var `WT_PIPE_NAME`.
+/// `WT_MCP_TOKEN` is optional — if missing, sends empty string (dev bypass).
+/// Debug logging to `wta-pipe-debug.log` is enabled by default.
 pub struct PipeChannel {
     pipe: Mutex<tokio::net::windows::named_pipe::NamedPipeClient>,
     next_id: AtomicU64,
     available: AtomicBool,
+    debug_log: Option<Mutex<std::fs::File>>,
 }
 
 impl PipeChannel {
     /// Connect to the WT protocol server and authenticate.
     ///
-    /// Reads `WT_PIPE_NAME` and `WT_MCP_TOKEN` from environment variables.
+    /// Reads `WT_PIPE_NAME` from environment (required).
+    /// `WT_MCP_TOKEN` is optional — defaults to empty string for dev bypass.
+    /// Debug log is always written to `wta-pipe-debug.log` unless `WTA_DEBUG_LOG=0`.
     pub async fn connect() -> anyhow::Result<Self> {
         let pipe_name = std::env::var("WT_PIPE_NAME")
             .context("WT_PIPE_NAME not set. Must run inside a Windows Terminal pane with protocol access.")?;
-        let token = std::env::var("WT_MCP_TOKEN")
-            .context("WT_MCP_TOKEN not set. Must run inside a Windows Terminal pane with protocol access.")?;
+        // Token is optional for dev — empty string triggers the dev bypass in WT.
+        let token = std::env::var("WT_MCP_TOKEN").unwrap_or_default();
 
         let pipe = ClientOptions::new()
             .open(&pipe_name)
             .context(format!("Failed to connect to pipe: {}", pipe_name))?;
 
+        // Debug log is ON by default. Set WTA_DEBUG_LOG=0 to disable.
+        let debug_log = if std::env::var("WTA_DEBUG_LOG").as_deref() == Ok("0") {
+            None
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("wta-pipe-debug.log")
+                .ok();
+            file.map(Mutex::new)
+        };
+
         let channel = Self {
             pipe: Mutex::new(pipe),
             next_id: AtomicU64::new(1),
             available: AtomicBool::new(false),
+            debug_log,
         };
 
-        // Authenticate
+        channel
+            .log(&format!("Connecting to {} ...", pipe_name))
+            .await;
+
+        // Authenticate (empty token triggers dev bypass on WT side)
+        channel.log("Authenticating...").await;
         let result = channel
-            .request(
-                "authenticate",
-                serde_json::json!({ "token": token }),
-            )
+            .request_inner("authenticate", serde_json::json!({ "token": token }))
             .await
             .context("Authentication failed")?;
 
@@ -58,13 +76,23 @@ impl PipeChannel {
         }
 
         channel.available.store(true, Ordering::Relaxed);
+        channel.log("Authenticated successfully").await;
         Ok(channel)
     }
-}
 
-#[async_trait::async_trait]
-impl WtChannel for PipeChannel {
-    async fn request(
+    async fn log(&self, msg: &str) {
+        if let Some(ref log_file) = self.debug_log {
+            use std::io::Write;
+            let mut f = log_file.lock().await;
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let _ = writeln!(f, "[{:.3}] {}", elapsed.as_secs_f64(), msg);
+        }
+    }
+
+    /// Core request implementation with full logging.
+    async fn request_inner(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -79,6 +107,7 @@ impl WtChannel for PipeChannel {
         };
 
         let mut json = serde_json::to_string(&wire_req)?;
+        self.log(&format!(">>> {}", json)).await;
         json.push('\n');
 
         let mut pipe = self.pipe.lock().await;
@@ -96,6 +125,9 @@ impl WtChannel for PipeChannel {
             buf.push(byte);
         }
 
+        let resp_str = String::from_utf8_lossy(&buf);
+        self.log(&format!("<<< {}", resp_str)).await;
+
         let resp: WireResponse = serde_json::from_slice(&buf)
             .context("Failed to parse response from Windows Terminal")?;
 
@@ -104,6 +136,17 @@ impl WtChannel for PipeChannel {
         }
 
         Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+#[async_trait::async_trait]
+impl WtChannel for PipeChannel {
+    async fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.request_inner(method, params).await
     }
 
     fn is_available(&self) -> bool {

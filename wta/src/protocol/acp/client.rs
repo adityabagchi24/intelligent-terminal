@@ -8,6 +8,21 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::app::{AppEvent, PermOption, PlanEntry, PlanEntryStatus};
 use crate::shell::{ShellManager, TerminalConfig};
 
+/// Write a line to wta-acp-debug.log (always on during dev).
+fn acp_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("wta-acp-debug.log")
+    {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let _ = writeln!(f, "[{:.3}] {}", elapsed.as_secs_f64(), msg);
+    }
+}
+
 /// Shared state accessible from the Client trait impl.
 struct ClientState {
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -25,6 +40,7 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
+        acp_log(&format!("request_permission: {:?}", args.tool_call.fields.title));
         let description = args
             .tool_call
             .fields
@@ -67,6 +83,7 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::SessionNotification,
     ) -> acp::Result<()> {
+        acp_log(&format!("session_notification: {:?}", args.update));
         match args.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
                 if let acp::ContentBlock::Text(text_content) = chunk.content {
@@ -115,6 +132,7 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
+        acp_log(&format!("create_terminal called: cmd={} args={:?}", args.command, args.args));
         let env: Vec<(String, String)> = args
             .env
             .iter()
@@ -151,6 +169,7 @@ impl acp::Client for WtaClient {
             .state
             .shell_mgr
             .get_output(&args.terminal_id.to_string())
+            .await
         {
             Ok(output) => {
                 let mut resp = acp::TerminalOutputResponse::new(output.data, false);
@@ -191,7 +210,8 @@ impl acp::Client for WtaClient {
         let _ = self
             .state
             .shell_mgr
-            .release(&args.terminal_id.to_string());
+            .release(&args.terminal_id.to_string())
+            .await;
         Ok(acp::ReleaseTerminalResponse::new())
     }
 
@@ -199,7 +219,11 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::KillTerminalRequest,
     ) -> acp::Result<acp::KillTerminalResponse> {
-        let _ = self.state.shell_mgr.kill(&args.terminal_id.to_string());
+        let _ = self
+            .state
+            .shell_mgr
+            .kill(&args.terminal_id.to_string())
+            .await;
         Ok(acp::KillTerminalResponse::new())
     }
 }
@@ -266,7 +290,7 @@ async fn run_inner(
     });
 
     // Initialize
-    conn.initialize(
+    let init_resp = conn.initialize(
         acp::InitializeRequest::new(acp::ProtocolVersion::V1)
             .client_capabilities(acp::ClientCapabilities::new().terminal(true))
             .client_info(
@@ -277,6 +301,9 @@ async fn run_inner(
     .await
     .map_err(|e| anyhow::anyhow!("initialize failed: {}", e))?;
 
+    // Log the agent's initialize response for debugging
+    acp_log(&format!("Agent init response: {:?}", init_resp));
+
     // Create session
     let cwd = std::env::current_dir().unwrap_or_default();
     let session = conn
@@ -285,6 +312,7 @@ async fn run_inner(
         .map_err(|e| anyhow::anyhow!("new_session failed: {}", e))?;
 
     let session_id = session.session_id.clone();
+    acp_log(&format!("Session created: {}", session_id));
 
     // Notify app of connection
     let agent_name = program.to_string();

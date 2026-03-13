@@ -89,6 +89,7 @@ pub struct App {
     pub state: ConnectionState,
     pub agent_name: String,
     pub session_id: String,
+    pub wt_connected: bool,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor_pos: usize,
@@ -101,11 +102,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(prompt_tx: mpsc::UnboundedSender<String>) -> Self {
+    pub fn new(prompt_tx: mpsc::UnboundedSender<String>, wt_connected: bool) -> Self {
         Self {
             state: ConnectionState::Connecting,
             agent_name: String::new(),
             session_id: String::new(),
+            wt_connected,
             messages: Vec::new(),
             input: String::new(),
             cursor_pos: 0,

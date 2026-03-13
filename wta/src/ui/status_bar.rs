@@ -35,7 +35,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         format!(" | session: {}", short)
     };
 
-    let text = format!("[wta] {} | {}{}", name, status_text, session_info);
+    let wt_info = if app.wt_connected { " | WT:pipe" } else { " | WT:local" };
+
+    let text = format!("[wta] {} | {}{}{}", name, status_text, session_info, wt_info);
     let p = Paragraph::new(text).style(status_style);
     frame.render_widget(p, area);
 }

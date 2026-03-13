@@ -45,20 +45,35 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let shell_mgr = Arc::new(ShellManager::new());
-
     if cli.test_pipe {
         return run_test_pipe().await;
-    } else if cli.mcp {
+    }
+
+    // Try to connect to the Windows Terminal pipe (non-fatal if unavailable).
+    let mut shell_mgr = ShellManager::new();
+    let wt_connected = match shell::wt_channel::PipeChannel::connect().await {
+        Ok(channel) => {
+            eprintln!("[wta] Connected to Windows Terminal pipe");
+            shell_mgr = shell_mgr.with_wt_channel(Arc::new(channel));
+            true
+        }
+        Err(e) => {
+            eprintln!("[wta] No WT pipe (local-only mode): {}", e);
+            false
+        }
+    };
+    let shell_mgr = Arc::new(shell_mgr);
+
+    if cli.mcp {
         // Headless MCP server mode — no TUI
         protocol::mcp::server::run_mcp_server(shell_mgr).await
     } else {
         // ACP TUI client mode (default)
-        run_acp_tui_mode(cli, shell_mgr).await
+        run_acp_tui_mode(cli, shell_mgr, wt_connected).await
     }
 }
 
-async fn run_acp_tui_mode(cli: Cli, shell_mgr: Arc<ShellManager>) -> Result<()> {
+async fn run_acp_tui_mode(cli: Cli, shell_mgr: Arc<ShellManager>, wt_connected: bool) -> Result<()> {
     // Init terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -67,7 +82,7 @@ async fn run_acp_tui_mode(cli: Cli, shell_mgr: Arc<ShellManager>) -> Result<()> 
     let mut terminal = Terminal::new(backend)?;
 
     // Run the app
-    let result = run_acp_app(&mut terminal, cli, shell_mgr).await;
+    let result = run_acp_app(&mut terminal, cli, shell_mgr, wt_connected).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -103,11 +118,65 @@ async fn run_test_pipe() -> Result<()> {
     Ok(())
 }
 
+/// Generate an MCP config JSON file that points to `wta --mcp`,
+/// passing through WT_PIPE_NAME and WT_MCP_TOKEN so the MCP server
+/// can connect to the same WT pipe. Returns the path to the config file.
+fn write_wta_mcp_config() -> Result<std::path::PathBuf> {
+    let wta_exe = std::env::current_exe()?.to_string_lossy().replace('\\', "/");
+    let pipe_name = std::env::var("WT_PIPE_NAME").unwrap_or_default().replace('\\', "/");
+    let token = std::env::var("WT_MCP_TOKEN").unwrap_or_default();
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "windows-terminal": {
+                "type": "stdio",
+                "command": wta_exe,
+                "args": ["--mcp"],
+                "env": {
+                    "WT_PIPE_NAME": pipe_name,
+                    "WT_MCP_TOKEN": token
+                }
+            }
+        }
+    });
+
+    let config_path = std::env::temp_dir().join("wta-mcp-config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    Ok(config_path)
+}
+
 async fn run_acp_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
     shell_mgr: Arc<ShellManager>,
+    wt_connected: bool,
 ) -> Result<()> {
+    // If WT pipe is connected, generate MCP config and inject into agent command
+    // so the agent gets WT tools (list_windows, read_pane_output, etc.)
+    let agent_cmd = if wt_connected {
+        match write_wta_mcp_config() {
+            Ok(config_path) => {
+                let config_str = config_path.to_string_lossy();
+                // Copilot uses --additional-mcp-config, Claude uses --mcp-config
+                let base = &cli.agent;
+                if base.contains("copilot") {
+                    format!("{} --additional-mcp-config @{}", base, config_str)
+                } else if base.contains("claude") {
+                    format!("{} --mcp-config {}", base, config_str)
+                } else {
+                    // Generic: try additional-mcp-config
+                    format!("{} --additional-mcp-config @{}", base, config_str)
+                }
+            }
+            Err(e) => {
+                eprintln!("[wta] Failed to write MCP config: {}", e);
+                cli.agent.clone()
+            }
+        }
+    } else {
+        cli.agent.clone()
+    };
+
     let local_set = tokio::task::LocalSet::new();
     local_set
         .run_until(async move {
@@ -121,7 +190,7 @@ async fn run_acp_app(
             // Start ACP client
             let acp_event_tx = event_tx.clone();
             tokio::task::spawn_local(protocol::acp::client::run_acp_client(
-                cli.agent.clone(),
+                agent_cmd,
                 cli.prompt.clone(),
                 acp_event_tx,
                 prompt_rx,
@@ -129,7 +198,7 @@ async fn run_acp_app(
             ));
 
             // Run main event loop
-            let mut app_state = app::App::new(prompt_tx);
+            let mut app_state = app::App::new(prompt_tx, wt_connected);
             app_state.run(terminal, event_rx).await
         })
         .await
