@@ -42,6 +42,13 @@ ProtocolRequestHandler::ProtocolRequestHandler(WindowEmperor& emperor) :
 {
 }
 
+ProtocolRequestHandler::~ProtocolRequestHandler()
+{
+    s_pipeServer.store(nullptr, std::memory_order_release);
+}
+
+std::atomic<TerminalProtocolServer*> ProtocolRequestHandler::s_pipeServer{ nullptr };
+
 void ProtocolRequestHandler::SetAuthToken(const std::string& token)
 {
     _authToken = token;
@@ -50,6 +57,7 @@ void ProtocolRequestHandler::SetAuthToken(const std::string& token)
 void ProtocolRequestHandler::SetServer(TerminalProtocolServer* server)
 {
     _server = server;
+    s_pipeServer.store(server, std::memory_order_release);
 }
 
 Json::Value ProtocolRequestHandler::_makeError(const std::string& code, const std::string& message)
@@ -277,87 +285,19 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
         // Found a page — register once. TerminalPage unconditionally raises
         // ProtocolVtSequenceReceived for all panes (wired in _RegisterTerminalEvents).
         _pageEventsRegistered = true;
-        auto* server = _server;
-
-        // Subscribe on the UI thread — TerminalPage is a DependencyObject
-        // with thread affinity; event subscription from a background thread
-        // throws RPC_E_WRONG_THREAD.
-        auto subscribeOnUI = [page, server]() {
-            page.ProtocolVtSequenceReceived(
-                [server](auto&&, const winrt::hstring& eventJson) {
-                    const auto jsonStr = winrt::to_string(eventJson);
-                    // Broadcast to named-pipe clients
-                    server->BroadcastEvent(jsonStr);
-                    // Broadcast to COM clients
-                    TerminalProtocolComServer::s_BroadcastEventToComClients(jsonStr);
-                });
-        };
-
-        if (page.Dispatcher().HasThreadAccess())
-        {
-            subscribeOnUI();
-        }
-        else
-        {
-            HANDLE completedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            page.Dispatcher().RunAsync(
-                winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-                [&]() {
-                    subscribeOnUI();
-                    SetEvent(completedEvent);
-                });
-            WaitForSingleObject(completedEvent, INFINITE);
-            CloseHandle(completedEvent);
-        }
+        page.ProtocolVtSequenceReceived(
+            [](auto&&, const winrt::hstring& eventJson) {
+                const auto jsonStr = winrt::to_string(eventJson);
+                // Broadcast to named-pipe clients (null-checked for shutdown safety)
+                if (auto* svr = ProtocolRequestHandler::GetPipeServer())
+                {
+                    svr->BroadcastEvent(jsonStr);
+                }
+                // Broadcast to COM clients
+                TerminalProtocolComServer::s_NotifyEventToComClients(jsonStr);
+            });
         break; // Single-window for now
     }
-}
-
-// ============================================================================
-// Helper: dispatch work to the XAML UI thread, blocking until complete.
-//
-// Handler methods are called from pipe I/O threads and COM MTA threads.
-// Accessing non-agile WinRT objects (TerminalPage, TerminalWindow,
-// WindowProperties) from these background threads corrupts XAML state.
-// This helper marshals all WinRT work to the UI thread.
-// ============================================================================
-
-template<typename F>
-static auto _dispatchToUIThread(const TerminalApp::TerminalPage& page, F&& func) -> decltype(func())
-{
-    using R = decltype(func());
-
-    if (page.Dispatcher().HasThreadAccess())
-    {
-        return func();
-    }
-
-    R result{};
-    std::exception_ptr exPtr;
-    HANDLE completedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-
-    page.Dispatcher().RunAsync(
-        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-        [&]() {
-            try
-            {
-                result = func();
-            }
-            catch (...)
-            {
-                exPtr = std::current_exception();
-            }
-            SetEvent(completedEvent);
-        });
-
-    WaitForSingleObject(completedEvent, INFINITE);
-    CloseHandle(completedEvent);
-
-    if (exPtr)
-    {
-        std::rethrow_exception(exPtr);
-    }
-    return result;
 }
 
 // ============================================================================
@@ -366,6 +306,7 @@ static auto _dispatchToUIThread(const TerminalApp::TerminalPage& page, F&& func)
 
 Json::Value ProtocolRequestHandler::_handleGetActivePane(const Json::Value& /*params*/)
 {
+    // Find the most recently focused window and get its active pane.
     const auto host = _emperor._mostRecentWindow();
     if (!host)
     {
@@ -378,137 +319,99 @@ Json::Value ProtocolRequestHandler::_handleGetActivePane(const Json::Value& /*pa
         throw std::runtime_error("Terminal page not available.");
     }
 
-    return _dispatchToUIThread(page, [&]() -> Json::Value {
-        const auto resultJson = winrt::to_string(page.GetProtocolActivePaneJson());
-        if (resultJson.empty())
-        {
-            throw std::runtime_error("No active pane.");
-        }
+    const auto info = page.GetProtocolActivePane();
+    if (info.PaneId.empty())
+    {
+        throw std::runtime_error("No active pane.");
+    }
 
-        Json::Value result;
-        Json::CharReaderBuilder readerBuilder;
-        std::string parseErrors;
-        std::istringstream stream(resultJson);
-        if (!Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-        {
-            throw std::runtime_error("Failed to parse active pane info.");
-        }
+    const auto& props = host->Logic().WindowProperties();
 
-        const auto& props = host->Logic().WindowProperties();
-        result["window_id"] = std::to_string(props.WindowId());
-        return result;
-    });
+    Json::Value result;
+    result["pane_id"] = winrt::to_string(info.PaneId);
+    result["tab_id"] = winrt::to_string(info.TabId);
+    result["window_id"] = std::to_string(props.WindowId());
+    result["title"] = winrt::to_string(info.Title);
+    result["profile"] = winrt::to_string(info.Profile);
+    result["is_active"] = info.IsActive;
+    result["pid"] = static_cast<Json::UInt>(info.Pid);
+    return result;
 }
 
 Json::Value ProtocolRequestHandler::_handleListWindows(const Json::Value& /*params*/)
 {
+    Json::Value result;
+    Json::Value windows(Json::arrayValue);
+
     const auto mostRecent = _emperor._mostRecentWindow();
 
-    // Need any page to get a Dispatcher for UI thread dispatch.
-    TerminalApp::TerminalPage anyPage{ nullptr };
     for (const auto& host : _emperor._windows)
     {
-        anyPage = _getPage(host.get());
-        if (anyPage)
-            break;
-    }
-    if (!anyPage)
-    {
-        throw std::runtime_error("No windows available.");
-    }
-
-    return _dispatchToUIThread(anyPage, [&]() -> Json::Value {
-        Json::Value result;
-        Json::Value windows(Json::arrayValue);
-
-        for (const auto& host : _emperor._windows)
+        const auto logic = host->Logic();
+        if (!logic)
         {
-            const auto logic = host->Logic();
-            if (!logic)
-            {
-                continue;
-            }
-
-            const auto& props = logic.WindowProperties();
-
-            Json::Value win;
-            win["window_id"] = std::to_string(props.WindowId());
-            win["title"] = winrt::to_string(props.WindowNameForDisplay());
-            win["is_focused"] = (host.get() == mostRecent);
-            win["tab_count"] = static_cast<Json::UInt>(logic.TabCount());
-            windows.append(win);
+            continue;
         }
 
-        result["windows"] = windows;
-        return result;
-    });
+        const auto& props = logic.WindowProperties();
+
+        Json::Value win;
+        win["window_id"] = std::to_string(props.WindowId());
+        win["title"] = winrt::to_string(props.WindowNameForDisplay());
+        win["is_focused"] = (host.get() == mostRecent);
+        win["tab_count"] = static_cast<Json::UInt>(logic.TabCount());
+        windows.append(win);
+    }
+
+    result["windows"] = windows;
+    return result;
 }
 
 Json::Value ProtocolRequestHandler::_handleListTabs(const Json::Value& params)
 {
     const auto windowIdFilter = params.get("window_id", "").asString();
 
-    TerminalApp::TerminalPage anyPage{ nullptr };
+    Json::Value result;
+    Json::Value allTabs(Json::arrayValue);
+
     for (const auto& host : _emperor._windows)
     {
-        anyPage = _getPage(host.get());
-        if (anyPage)
-            break;
-    }
-    if (!anyPage)
-    {
-        throw std::runtime_error("No windows available.");
-    }
-
-    return _dispatchToUIThread(anyPage, [&]() -> Json::Value {
-        Json::Value result;
-        Json::Value allTabs(Json::arrayValue);
-
-        for (const auto& host : _emperor._windows)
+        const auto logic = host->Logic();
+        if (!logic)
         {
-            const auto logic = host->Logic();
-            if (!logic)
-            {
-                continue;
-            }
-
-            const auto& props = logic.WindowProperties();
-            const auto windowIdStr = std::to_string(props.WindowId());
-
-            if (!windowIdFilter.empty() && windowIdStr != windowIdFilter)
-            {
-                continue;
-            }
-
-            const auto page = _getPage(host.get());
-            if (!page)
-            {
-                continue;
-            }
-
-            const auto tabsJson = winrt::to_string(page.GetProtocolTabsJson());
-            if (tabsJson.empty())
-            {
-                continue;
-            }
-
-            Json::Value tabs;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(tabsJson);
-            if (Json::parseFromStream(readerBuilder, stream, &tabs, &parseErrors) && tabs.isArray())
-            {
-                for (auto& tab : tabs)
-                {
-                    tab["window_id"] = windowIdStr;
-                    allTabs.append(tab);
-                }
-            }
+            continue;
         }
 
-        result["tabs"] = allTabs;
-        return result;
-    });
+        const auto& props = logic.WindowProperties();
+        const auto windowIdStr = std::to_string(props.WindowId());
+
+        if (!windowIdFilter.empty() && windowIdStr != windowIdFilter)
+        {
+            continue;
+        }
+
+        const auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+
+        const auto tabs = page.GetProtocolTabs();
+        for (uint32_t i = 0; i < tabs.Size(); ++i)
+        {
+            const auto& t = tabs.GetAt(i);
+            Json::Value tab;
+            tab["tab_id"] = winrt::to_string(t.TabId);
+            tab["window_id"] = windowIdStr;
+            tab["title"] = winrt::to_string(t.Title);
+            tab["is_active"] = t.IsActive;
+            tab["pane_count"] = t.PaneCount;
+            allTabs.append(tab);
+        }
+    }
+
+    result["tabs"] = allTabs;
+    return result;
 }
 
 Json::Value ProtocolRequestHandler::_handleListPanes(const Json::Value& params)
@@ -516,67 +419,51 @@ Json::Value ProtocolRequestHandler::_handleListPanes(const Json::Value& params)
     const auto tabIdFilter = params.get("tab_id", "").asString();
     const auto windowIdFilter = params.get("window_id", "").asString();
 
-    TerminalApp::TerminalPage anyPage{ nullptr };
+    Json::Value result;
+    Json::Value allPanes(Json::arrayValue);
+
     for (const auto& host : _emperor._windows)
     {
-        anyPage = _getPage(host.get());
-        if (anyPage)
-            break;
-    }
-    if (!anyPage)
-    {
-        throw std::runtime_error("No windows available.");
-    }
-
-    return _dispatchToUIThread(anyPage, [&]() -> Json::Value {
-        Json::Value result;
-        Json::Value allPanes(Json::arrayValue);
-
-        for (const auto& host : _emperor._windows)
+        const auto logic = host->Logic();
+        if (!logic)
         {
-            const auto logic = host->Logic();
-            if (!logic)
-            {
-                continue;
-            }
-
-            const auto& props = logic.WindowProperties();
-            const auto windowIdStr = std::to_string(props.WindowId());
-
-            if (!windowIdFilter.empty() && windowIdStr != windowIdFilter)
-            {
-                continue;
-            }
-
-            const auto page = _getPage(host.get());
-            if (!page)
-            {
-                continue;
-            }
-
-            const auto panesJson = winrt::to_string(page.GetProtocolPanesJson(winrt::to_hstring(tabIdFilter)));
-            if (panesJson.empty())
-            {
-                continue;
-            }
-
-            Json::Value panes;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(panesJson);
-            if (Json::parseFromStream(readerBuilder, stream, &panes, &parseErrors) && panes.isArray())
-            {
-                for (auto& pane : panes)
-                {
-                    pane["window_id"] = windowIdStr;
-                    allPanes.append(pane);
-                }
-            }
+            continue;
         }
 
-        result["panes"] = allPanes;
-        return result;
-    });
+        const auto& props = logic.WindowProperties();
+        const auto windowIdStr = std::to_string(props.WindowId());
+
+        if (!windowIdFilter.empty() && windowIdStr != windowIdFilter)
+        {
+            continue;
+        }
+
+        const auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+
+        const auto panes = page.GetProtocolPanes(winrt::to_hstring(tabIdFilter));
+        for (uint32_t i = 0; i < panes.Size(); ++i)
+        {
+            const auto& p = panes.GetAt(i);
+            Json::Value pane;
+            pane["pane_id"] = winrt::to_string(p.PaneId);
+            pane["tab_id"] = winrt::to_string(p.TabId);
+            pane["window_id"] = windowIdStr;
+            pane["title"] = winrt::to_string(p.Title);
+            pane["profile"] = winrt::to_string(p.Profile);
+            pane["is_active"] = p.IsActive;
+            pane["pid"] = static_cast<Json::UInt>(p.Pid);
+            pane["size"]["rows"] = p.Rows;
+            pane["size"]["columns"] = p.Columns;
+            allPanes.append(pane);
+        }
+    }
+
+    result["panes"] = allPanes;
+    return result;
 }
 
 Json::Value ProtocolRequestHandler::_handleReadPaneOutput(const Json::Value& params)
@@ -599,21 +486,19 @@ Json::Value ProtocolRequestHandler::_handleReadPaneOutput(const Json::Value& par
             continue;
         }
 
-        const auto resultJson = winrt::to_string(page.ReadProtocolPaneOutput(
+        const auto info = page.ReadProtocolPaneOutput(
             winrt::to_hstring(paneIdStr),
             winrt::to_hstring(source),
-            maxLines));
+            maxLines);
 
-        if (!resultJson.empty())
+        if (!info.PaneId.empty())
         {
             Json::Value result;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(resultJson);
-            if (Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-            {
-                return result;
-            }
+            result["pane_id"] = winrt::to_string(info.PaneId);
+            result["content"] = winrt::to_string(info.Content);
+            result["line_count"] = info.LineCount;
+            result["truncated"] = info.Truncated;
+            return result;
         }
     }
 
@@ -636,17 +521,16 @@ Json::Value ProtocolRequestHandler::_handleGetProcessStatus(const Json::Value& p
             continue;
         }
 
-        const auto resultJson = winrt::to_string(page.GetProtocolProcessStatus(winrt::to_hstring(paneIdStr)));
-        if (!resultJson.empty())
+        const auto info = page.GetProtocolProcessStatus(winrt::to_hstring(paneIdStr));
+        if (!info.PaneId.empty())
         {
             Json::Value result;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(resultJson);
-            if (Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-            {
-                return result;
-            }
+            result["pane_id"] = winrt::to_string(info.PaneId);
+            result["state"] = winrt::to_string(info.State);
+            result["pid"] = static_cast<Json::UInt>(info.Pid);
+            if (info.HasExitCode)
+                result["exit_code"] = info.ExitCode;
+            return result;
         }
     }
 
@@ -671,20 +555,18 @@ Json::Value ProtocolRequestHandler::_handleGetSessionVariable(const Json::Value&
             continue;
         }
 
-        const auto resultJson = winrt::to_string(page.GetProtocolSessionVariable(
+        const auto info = page.GetProtocolSessionVariable(
             winrt::to_hstring(paneIdStr),
-            winrt::to_hstring(name)));
+            winrt::to_hstring(name));
 
-        if (!resultJson.empty())
+        if (!info.PaneId.empty())
         {
             Json::Value result;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(resultJson);
-            if (Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-            {
-                return result;
-            }
+            result["pane_id"] = winrt::to_string(info.PaneId);
+            result["name"] = winrt::to_string(info.Name);
+            result["value"] = info.Exists ? winrt::to_string(info.Value) : "";
+            result["exists"] = info.Exists;
+            return result;
         }
     }
 
@@ -770,25 +652,21 @@ Json::Value ProtocolRequestHandler::_handleCreateTab(const Json::Value& params)
 
     const auto background = params.get("background", true).asBool();
 
-    const auto resultJson = winrt::to_string(page.CreateProtocolTab(newTermArgs, background));
+    const auto cr = page.CreateProtocolTab(newTermArgs, background);
     // Note: CreateProtocolTab clears pending env vars internally.
-    if (resultJson.empty())
+    if (cr.TabId.empty())
     {
         throw std::runtime_error("Failed to create tab.");
     }
 
-    // Parse result and add window_id.
-    Json::Value result;
-    Json::CharReaderBuilder readerBuilder;
-    std::string parseErrors;
-    std::istringstream stream(resultJson);
-    if (!Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-    {
-        throw std::runtime_error("Failed to parse tab creation result.");
-    }
-
     const auto& props = targetHost->Logic().WindowProperties();
+
+    Json::Value result;
+    result["tab_id"] = winrt::to_string(cr.TabId);
+    result["pane_id"] = winrt::to_string(cr.PaneId);
     result["window_id"] = std::to_string(props.WindowId());
+    if (cr.Pid != 0)
+        result["pid"] = static_cast<Json::UInt>(cr.Pid);
     return result;
 }
 
@@ -845,19 +723,17 @@ Json::Value ProtocolRequestHandler::_handleSplitPane(const Json::Value& params)
         }
 
         // Note: SplitProtocolPane clears pending env vars internally.
-        const auto resultJson = winrt::to_string(page.SplitProtocolPane(
-            winrt::to_hstring(paneIdStr), splitDir, size, newTermArgs, background));
+        const auto cr = page.SplitProtocolPane(
+            winrt::to_hstring(paneIdStr), splitDir, size, newTermArgs, background);
 
-        if (!resultJson.empty())
+        if (!cr.TabId.empty())
         {
             Json::Value result;
-            Json::CharReaderBuilder readerBuilder;
-            std::string parseErrors;
-            std::istringstream stream(resultJson);
-            if (Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-            {
-                return result;
-            }
+            result["tab_id"] = winrt::to_string(cr.TabId);
+            result["pane_id"] = winrt::to_string(cr.PaneId);
+            if (cr.Pid != 0)
+                result["pid"] = static_cast<Json::UInt>(cr.Pid);
+            return result;
         }
     }
 
@@ -1054,31 +930,26 @@ Json::Value ProtocolRequestHandler::_handleQuickPick(const Json::Value& params)
         throw std::runtime_error("Terminal page not available.");
     }
 
-    // Dispatch to UI thread.  ShowProtocolQuickPick internally uses
-    // _waitWithMessagePump which keeps the XAML message loop alive,
-    // so the palette remains interactive while we block here.
-    return _dispatchToUIThread(page, [&]() -> Json::Value {
-        const auto resultJson = winrt::to_string(page.ShowProtocolQuickPick(
-            winrt::to_hstring(title),
-            winrt::to_hstring(choicesJsonStr),
-            allowFreeInput));
+    const auto resultJson = winrt::to_string(page.ShowProtocolQuickPick(
+        winrt::to_hstring(title),
+        winrt::to_hstring(choicesJsonStr),
+        allowFreeInput));
 
-        if (resultJson.empty())
-        {
-            throw std::runtime_error("Quick pick dialog failed.");
-        }
+    if (resultJson.empty())
+    {
+        throw std::runtime_error("Quick pick dialog failed.");
+    }
 
-        Json::Value result;
-        Json::CharReaderBuilder readerBuilder;
-        std::string parseErrors;
-        std::istringstream stream(resultJson);
-        if (!Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
-        {
-            throw std::runtime_error("Failed to parse quick pick result.");
-        }
+    Json::Value result;
+    Json::CharReaderBuilder readerBuilder;
+    std::string parseErrors;
+    std::istringstream stream(resultJson);
+    if (!Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
+    {
+        throw std::runtime_error("Failed to parse quick pick result.");
+    }
 
-        return result;
-    });
+    return result;
 }
 
 // ============================================================================

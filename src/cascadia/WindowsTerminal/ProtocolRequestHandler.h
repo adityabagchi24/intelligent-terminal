@@ -5,6 +5,7 @@
 
 #include <json/json.h>
 #include <functional>
+#include <atomic>
 
 class WindowEmperor;
 class AppHost;
@@ -19,6 +20,7 @@ class ProtocolRequestHandler
 {
 public:
     explicit ProtocolRequestHandler(WindowEmperor& emperor);
+    ~ProtocolRequestHandler();
 
     // Process a fully parsed request. Returns the response JSON.
     // Called from the pipe I/O thread.
@@ -32,6 +34,9 @@ public:
 
     // Set server reference for broadcasting events.
     void SetServer(TerminalProtocolServer* server);
+
+    // Thread-safe access to the pipe server for event lambdas.
+    static TerminalProtocolServer* GetPipeServer() noexcept { return s_pipeServer.load(std::memory_order_acquire); }
 
 private:
     // Method handlers - each returns a Json::Value result or throws
@@ -89,6 +94,7 @@ private:
     void _ensurePageEventsRegistered();
 
     TerminalProtocolServer* _server = nullptr;
+    static std::atomic<TerminalProtocolServer*> s_pipeServer;
     std::string _authToken;
     bool _pageEventsRegistered = false;
 
