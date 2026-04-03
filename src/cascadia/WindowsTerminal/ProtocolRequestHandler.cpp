@@ -285,17 +285,40 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
         // Found a page — register once. TerminalPage unconditionally raises
         // ProtocolVtSequenceReceived for all panes (wired in _RegisterTerminalEvents).
         _pageEventsRegistered = true;
-        page.ProtocolVtSequenceReceived(
-            [](auto&&, const winrt::hstring& eventJson) {
-                const auto jsonStr = winrt::to_string(eventJson);
-                // Broadcast to named-pipe clients (null-checked for shutdown safety)
-                if (auto* svr = ProtocolRequestHandler::GetPipeServer())
-                {
-                    svr->BroadcastEvent(jsonStr);
-                }
-                // Broadcast to COM clients
-                TerminalProtocolComServer::s_NotifyEventToComClients(jsonStr);
-            });
+
+        // TerminalPage is a DependencyObject with UI thread affinity.
+        // Subscribing to its events from a background thread (pipe I/O)
+        // throws RPC_E_WRONG_THREAD. Dispatch subscription to UI thread.
+        auto subscribeOnUI = [page]() {
+            page.ProtocolVtSequenceReceived(
+                [](auto&&, const winrt::hstring& eventJson) {
+                    const auto jsonStr = winrt::to_string(eventJson);
+                    // Broadcast to named-pipe clients (null-checked for shutdown safety)
+                    if (auto* svr = ProtocolRequestHandler::GetPipeServer())
+                    {
+                        svr->BroadcastEvent(jsonStr);
+                    }
+                    // Broadcast to COM clients
+                    TerminalProtocolComServer::s_NotifyEventToComClients(jsonStr);
+                });
+        };
+
+        if (page.Dispatcher().HasThreadAccess())
+        {
+            subscribeOnUI();
+        }
+        else
+        {
+            HANDLE completedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            page.Dispatcher().RunAsync(
+                winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                [&]() {
+                    subscribeOnUI();
+                    SetEvent(completedEvent);
+                });
+            WaitForSingleObject(completedEvent, INFINITE);
+            CloseHandle(completedEvent);
+        }
         break; // Single-window for now
     }
 }

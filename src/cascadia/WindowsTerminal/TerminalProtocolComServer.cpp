@@ -145,10 +145,32 @@ void TerminalProtocolComServer::_ensurePageEventsRegistered()
         if (!page)
             continue;
 
-        page.ProtocolVtSequenceReceived(
-            [](auto&&, const winrt::hstring& eventJson) {
-                s_NotifyEventToComClients(winrt::to_string(eventJson));
-            });
+        // TerminalPage is a DependencyObject with UI thread affinity.
+        // Subscribing to its events from a background thread (MTA worker)
+        // throws RPC_E_WRONG_THREAD. Dispatch subscription to UI thread.
+        auto subscribeOnUI = [page]() {
+            page.ProtocolVtSequenceReceived(
+                [](auto&&, const winrt::hstring& eventJson) {
+                    s_NotifyEventToComClients(winrt::to_string(eventJson));
+                });
+        };
+
+        if (page.Dispatcher().HasThreadAccess())
+        {
+            subscribeOnUI();
+        }
+        else
+        {
+            HANDLE completedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            page.Dispatcher().RunAsync(
+                winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                [&]() {
+                    subscribeOnUI();
+                    SetEvent(completedEvent);
+                });
+            WaitForSingleObject(completedEvent, INFINITE);
+            CloseHandle(completedEvent);
+        }
         break; // Single-window for now
     }
 }
