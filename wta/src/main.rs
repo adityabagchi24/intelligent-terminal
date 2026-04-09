@@ -29,7 +29,7 @@ use shell::ShellManager;
 #[derive(Parser, Debug)]
 #[command(
     name = "wta",
-    about = "Windows Terminal Agent — ACP TUI client / MCP tool server / tmux-like CLI"
+    about = "Windows Terminal Agent — ACP TUI client / tmux-like CLI"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,8 +48,6 @@ struct Cli {
     delegate_agent: Option<String>,
 
     // Legacy flags (hidden, backward compat)
-    #[arg(long, hide = true)]
-    mcp: bool,
     #[arg(long, hide = true)]
     info: bool,
     #[arg(long, hide = true)]
@@ -70,9 +68,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run as MCP server (headless, no TUI)
-    Mcp,
-
     /// Show Windows Terminal protocol connection info
     Info,
 
@@ -289,15 +284,10 @@ async fn main() -> Result<()> {
     if cli.info {
         return run_info_mode(&pipe_override).await;
     }
-    if cli.mcp {
-        return run_mcp_mode(&pipe_override).await;
-    }
-
     let json_mode = cli.json;
 
     match cli.command {
         // Subcommand aliases for legacy modes
-        Some(Command::Mcp) => run_mcp_mode(&pipe_override).await,
         Some(Command::Info) => run_info_mode(&pipe_override).await,
         Some(Command::TestPipe) => run_test_pipe(&pipe_override).await,
 
@@ -1055,7 +1045,6 @@ async fn delegate_with_context(
         .ok_or_else(|| anyhow::anyhow!("no delegate agent configured"))?;
 
     let commandline = crate::coordinator::build_delegate_commandline(runtime, &full_prompt)?;
-    let use_shell = crate::coordinator::needs_shell_launch(&runtime.commandline);
 
     // Log the final commandline for diagnostics.
     {
@@ -1067,11 +1056,10 @@ async fn delegate_with_context(
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
             }
         }
-        dlog(&format!("delegate_with_context: commandline={:?} cwd={:?} use_shell={}", commandline, cwd, use_shell));
+        dlog(&format!("delegate_with_context: commandline={:?} cwd={:?}", commandline, cwd));
     }
 
     // Launch the delegate agent directly as the tab process.
-    // CreateProcess passes args directly — no shell escaping issues.
     shell_mgr
         .wt_create_tab(Some(&commandline), cwd, None)
         .await?;
@@ -1285,20 +1273,6 @@ async fn run_default_tui(cli: Cli, po: PipeOverride) -> Result<()> {
     };
 
     run_acp_tui_mode(cli, shell_mgr, wt_connected, debug_rx, pane_identity, wt_event_rx, wt_pipe_channel).await
-}
-
-async fn run_mcp_mode(po: &PipeOverride) -> Result<()> {
-    // Need a ShellManager with WT channel for MCP server
-    let mut shell_mgr = ShellManager::new();
-    match connect_channel(po).await {
-        Ok(channel) => {
-            shell_mgr = shell_mgr.with_wt_channel(Arc::new(channel));
-        }
-        Err(e) => {
-            eprintln!("[wta] No WT pipe for MCP: {}", e);
-        }
-    }
-    protocol::mcp::server::run_mcp_server(Arc::new(shell_mgr)).await
 }
 
 // ─── Existing functions (preserved) ─────────────────────────────────────────
@@ -1542,44 +1516,6 @@ async fn run_info_mode(po: &PipeOverride) -> Result<()> {
     Ok(())
 }
 
-/// Generate an MCP config JSON file that points to `wta --mcp`,
-/// passing through pipe name and token so the MCP server can connect
-/// to the same WT pipe. Uses resolved pipe info (CLI override > VT > env).
-fn write_wta_mcp_config(po: &PipeOverride) -> Result<std::path::PathBuf> {
-    let wta_exe = std::env::current_exe()?
-        .to_string_lossy()
-        .replace('\\', "/");
-
-    // Use resolved pipe info so --pipe-name propagates to spawned MCP server
-    let (pipe_name, token) = match resolve_pipe_info(po) {
-        Some(info) => (info.pipe_name.replace('\\', "/"), info.token),
-        None => (
-            std::env::var("WT_PIPE_NAME")
-                .unwrap_or_default()
-                .replace('\\', "/"),
-            std::env::var("WT_MCP_TOKEN").unwrap_or_default(),
-        ),
-    };
-
-    let config = serde_json::json!({
-        "mcpServers": {
-            "windows-terminal": {
-                "type": "stdio",
-                "command": wta_exe,
-                "args": ["--mcp"],
-                "env": {
-                    "WT_PIPE_NAME": pipe_name,
-                    "WT_MCP_TOKEN": token
-                }
-            }
-        }
-    });
-
-    let config_path = std::env::temp_dir().join("wta-mcp-config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-    Ok(config_path)
-}
-
 async fn run_acp_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
@@ -1590,31 +1526,7 @@ async fn run_acp_app(
     wt_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
     wt_pipe_channel: Option<Arc<PipeChannel>>,
 ) -> Result<()> {
-    let po = PipeOverride {
-        pipe_name: cli.pipe_name.clone(),
-        pipe_token: cli.pipe_token.clone(),
-    };
-    let agent_cmd = if wt_connected {
-        match write_wta_mcp_config(&po) {
-            Ok(config_path) => {
-                let config_str = config_path.to_string_lossy();
-                let base = &cli.agent;
-                if base.contains("copilot") {
-                    format!("{} --additional-mcp-config @{}", base, config_str)
-                } else if base.contains("claude") {
-                    format!("{} --mcp-config {}", base, config_str)
-                } else {
-                    format!("{} --additional-mcp-config @{}", base, config_str)
-                }
-            }
-            Err(e) => {
-                eprintln!("[wta] Failed to write MCP config: {}", e);
-                cli.agent.clone()
-            }
-        }
-    } else {
-        cli.agent.clone()
-    };
+    let agent_cmd = cli.agent.clone();
 
     let local_set = tokio::task::LocalSet::new();
     local_set

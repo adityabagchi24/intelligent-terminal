@@ -29,13 +29,17 @@ pub struct AgentCliProfile {
     pub id: &'static str,
     pub display_name: &'static str,
     pub prompt_flag: PromptFlag,
+    /// Preferred extension search order when resolving a bare name on PATH.
+    /// E.g. `&[".cmd", ".exe"]` means try `<name>.cmd` first, then `<name>.exe`.
+    pub exe_search_order: &'static [&'static str],
 }
 
 /// Registry of known agent CLIs.
 const KNOWN_AGENTS: &[AgentCliProfile] = &[
-    AgentCliProfile { id: "copilot",  display_name: "GitHub Copilot", prompt_flag: PromptFlag::Flag("-i") },
-    AgentCliProfile { id: "claude",   display_name: "Claude",         prompt_flag: PromptFlag::Positional },
-    AgentCliProfile { id: "codex",    display_name: "Codex",          prompt_flag: PromptFlag::Positional },
+    AgentCliProfile { id: "copilot",  display_name: "GitHub Copilot", prompt_flag: PromptFlag::Flag("-i"),  exe_search_order: &[".exe"] },
+    AgentCliProfile { id: "claude",   display_name: "Claude",         prompt_flag: PromptFlag::Positional,  exe_search_order: &[".exe", ".cmd"] },
+    AgentCliProfile { id: "codex",    display_name: "Codex",          prompt_flag: PromptFlag::Positional,  exe_search_order: &[".exe", ".cmd"] },
+    AgentCliProfile { id: "gemini",   display_name: "Gemini",         prompt_flag: PromptFlag::Positional,  exe_search_order: &[".exe", ".cmd"] },
 ];
 
 /// Default profile for unknown agents.
@@ -43,16 +47,20 @@ const DEFAULT_AGENT_PROFILE: AgentCliProfile = AgentCliProfile {
     id: "unknown",
     display_name: "Agent",
     prompt_flag: PromptFlag::Flag("-i"),
+    exe_search_order: &[".exe", ".cmd"],
 };
 
 /// Look up an agent CLI profile by executable name.
 pub fn agent_cli_profile(executable: &str) -> &AgentCliProfile {
-    let lower = executable
+    let basename = executable
         .rsplit(|ch: char| ch == '\\' || ch == '/')
         .next()
-        .unwrap_or(executable)
+        .unwrap_or(executable);
+    let lower = basename
         .strip_suffix(".exe")
-        .unwrap_or(executable)
+        .or_else(|| basename.strip_suffix(".cmd"))
+        .or_else(|| basename.strip_suffix(".bat"))
+        .unwrap_or(basename)
         .to_ascii_lowercase();
     KNOWN_AGENTS
         .iter()
@@ -487,13 +495,41 @@ fn build_delegate_launch_commandline(
     if commandline.is_empty() {
         bail!("delegate agent runtime commandline is empty");
     }
-    match runtime.prompt_delivery {
-        DelegatePromptDelivery::LaunchThenSend => Ok(commandline.to_string()),
+    // Resolve bare names (e.g. "claude" → "claude.exe") at launch time so we
+    // always see the current PATH, not a stale snapshot from process startup.
+    let resolved = resolve_commandline_executable(commandline);
+    let resolved_ref = resolved.as_str();
+    let raw = match runtime.prompt_delivery {
+        DelegatePromptDelivery::LaunchThenSend => resolved_ref.to_string(),
         DelegatePromptDelivery::LaunchWithStartupPrompt => {
             ensure_non_empty("input", input)?;
-            build_delegate_startup_prompt_commandline(commandline, input)
+            build_delegate_startup_prompt_commandline(resolved_ref, input)?
+        }
+    };
+    // .cmd/.bat shims (e.g. npm-installed CLIs) can't be launched directly
+    // via CreateProcess — wrap with cmd /c so the command interpreter finds them.
+    if needs_shell_launch(resolved_ref) {
+        Ok(format!("cmd /c {}", raw))
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Resolve the first token (executable) of a commandline using the agent CLI
+/// registry's PATH search order.  Returns the commandline with the resolved
+/// executable, or the original commandline unchanged.
+fn resolve_commandline_executable(commandline: &str) -> String {
+    let tokens = split_windows_commandline(commandline);
+    if let Some(first) = tokens.first() {
+        let resolved = resolve_bare_agent_name(first);
+        if resolved != *first {
+            let mut parts = vec![resolved];
+            parts.extend(tokens[1..].iter().cloned());
+            let args: Vec<&str> = parts.iter().map(String::as_str).collect();
+            return join_windows_commandline(&args);
         }
     }
+    commandline.to_string()
 }
 
 fn resolve_delegate_runtime_commandline(
@@ -504,6 +540,9 @@ fn resolve_delegate_runtime_commandline(
         .map(str::trim)
         .filter(|cmd| !cmd.is_empty())
     {
+        // Store the bare name as-is. Executable resolution (e.g. "claude" →
+        // "claude.exe") happens at launch time in build_delegate_launch_commandline
+        // so it always sees the current PATH.
         return Some(commandline.to_string());
     }
 
@@ -611,6 +650,40 @@ fn needs_cmd_wrapper(command: &str) -> bool {
 
     // No .exe found on PATH — likely a .cmd/.bat shim, needs wrapping.
     true
+}
+
+/// Resolve a bare agent name (e.g. "claude") to the concrete executable found
+/// on PATH (e.g. "claude.cmd") using the agent's preferred search order from
+/// the registry. If the input already has a path separator or file extension,
+/// it is returned unchanged.
+fn resolve_bare_agent_name(bare_name: &str) -> String {
+    let trimmed = bare_name.trim().trim_matches('"');
+    // Already has a path separator — user provided a full/relative path.
+    if trimmed.contains('\\') || trimmed.contains('/') {
+        return bare_name.to_string();
+    }
+    // Already has a file extension — user was explicit.
+    if std::path::Path::new(trimmed).extension().is_some() {
+        return bare_name.to_string();
+    }
+
+    let profile = agent_cli_profile(trimmed);
+    let path_var = match std::env::var("PATH") {
+        Ok(v) => v,
+        Err(_) => return bare_name.to_string(),
+    };
+
+    for ext in profile.exe_search_order {
+        let candidate = format!("{}{}", trimmed, ext);
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join(&candidate).is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    // Not found on PATH — return bare name, downstream cmd /c will handle it.
+    bare_name.to_string()
 }
 
 fn split_windows_commandline(commandline: &str) -> Vec<String> {

@@ -344,7 +344,6 @@ pub struct App {
     pub wt_notifications: std::collections::VecDeque<WtNotification>,
     pub show_notification_banner: bool,
     // Auto-fix: timestamp of last auto-fix prompt to debounce rapid errors
-    last_autofix_unix_s: f64,
     // Auto-fix: the pane ID where the error occurred (used to auto-fill Send parent)
     pub autofix_pane_id: Option<String>,
 }
@@ -404,7 +403,6 @@ impl App {
             pending_completed_turn: None,
             wt_notifications: VecDeque::new(),
             show_notification_banner: false,
-            last_autofix_unix_s: 0.0,
             autofix_pane_id: None,
         }
     }
@@ -1010,8 +1008,6 @@ impl App {
                 } else if self.history_navigation_enabled() {
                     self.toggle_selected_history_turn();
                 } else if !self.input.is_empty() && self.state == ConnectionState::Connected {
-                    // User manually submitted a prompt — re-enable auto-fix.
-                    self.last_autofix_unix_s = 0.0;
                     let text = self.input.clone();
                     self.input.clear();
                     self.cursor_pos = 0;
@@ -1264,13 +1260,6 @@ impl App {
         {
             return;
         }
-
-        // One-shot: only auto-fix once until the user manually submits a new prompt.
-        // This prevents cascading loops when the fix itself fails.
-        if self.last_autofix_unix_s > 0.0 {
-            return;
-        }
-        self.last_autofix_unix_s = now_unix_s();
 
         let prompt_text = format!(
             "[auto-fix] {}\nDiagnose the error and suggest a fix.",

@@ -260,8 +260,26 @@ try {
     Ensure-Directory $InstallDir
     Stop-RunningInstalledProcesses -InstallRoot $InstallDir
     Write-Status "Installing to $InstallDir ..."
+
+    # Preserve user settings across upgrades.
+    $settingsDir = Join-Path $InstallDir 'settings'
+    $settingsBackup = $null
+    if (Test-Path $settingsDir -PathType Container) {
+        $settingsBackup = Join-Path ([System.IO.Path]::GetTempPath()) "agentic-terminal-settings-backup-$([System.IO.Path]::GetRandomFileName())"
+        Copy-Item -Path $settingsDir -Destination $settingsBackup -Recurse -Force
+        Write-Status "Backed up settings to $settingsBackup"
+    }
+
     Remove-DirectoryContents $InstallDir
     Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $InstallDir -Recurse -Force
+
+    # Restore preserved settings.
+    if ($settingsBackup -and (Test-Path $settingsBackup -PathType Container)) {
+        Ensure-Directory $settingsDir
+        Copy-Item -Path (Join-Path $settingsBackup '*') -Destination $settingsDir -Recurse -Force
+        Remove-Item $settingsBackup -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Status "Restored user settings"
+    }
 
     $terminalExe = Join-Path $InstallDir 'WindowsTerminal.exe'
     $wtaExe = Join-Path $InstallDir 'wta.exe'

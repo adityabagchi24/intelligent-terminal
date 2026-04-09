@@ -262,6 +262,14 @@ static TerminalApp::TerminalPage _getPage(AppHost* host)
     return root.try_as<TerminalApp::TerminalPage>();
 }
 
+namespace {
+    struct PipeBroadcastContext
+    {
+        TerminalProtocolServer* server;
+        std::string eventJson;
+    };
+}
+
 void ProtocolRequestHandler::_ensurePageEventsRegistered()
 {
     if (_pageEventsRegistered || !_server)
@@ -279,7 +287,25 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
         auto* server = _server;
         page.ProtocolVtSequenceReceived(
             [server](auto&&, const winrt::hstring& eventJson) {
-                server->BroadcastEvent(winrt::to_string(eventJson));
+                // Dispatch pipe write to the thread pool to avoid blocking the
+                // connection output handler thread.  _writeRaw may block for up
+                // to 5 s when the 4 KB pipe buffer is full, which freezes pane
+                // rendering if called inline on the conpty reader thread.
+                auto* ctx = new PipeBroadcastContext{ server, winrt::to_string(eventJson) };
+                if (!TrySubmitThreadpoolCallback(
+                        [](PTP_CALLBACK_INSTANCE, PVOID pv) noexcept {
+                            auto* c = static_cast<PipeBroadcastContext*>(pv);
+                            c->server->BroadcastEvent(c->eventJson);
+                            delete c;
+                        },
+                        ctx,
+                        nullptr))
+                {
+                    // Thread pool submission failed — fall back to inline delivery
+                    // to avoid leaking events entirely.
+                    server->BroadcastEvent(ctx->eventJson);
+                    delete ctx;
+                }
             });
         break; // Single-window for now
     }
