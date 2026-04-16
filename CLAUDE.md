@@ -84,15 +84,58 @@ Detects command failures in other panes and auto-suggests fixes via the agent.
 
 ## Build
 
+There are two independent build systems. **Both must be built** before F5.
+
+### 1. WTA (Rust) — build first
+
 ```bash
-# Kill stale WTA first
+# Kill stale WTA processes first
 taskkill //f //im wta.exe 2>/dev/null; true
 
-# Terminal (C++ / MSBuild) — incremental
-cmd.exe //c "tools\razzle.cmd && bcz no_clean"
-# Release: bcz rel no_clean | Output: bin/x64/Debug/ | Debug: VS → CascadiaPackage → F5
-
-# WTA (Rust)
 cargo build --manifest-path wta/Cargo.toml
 # Output: wta/target/debug/wta.exe
 ```
+
+### 2. Terminal (C++ / MSBuild)
+
+**Command line (incremental):**
+```bash
+cmd.exe //c "tools\razzle.cmd && bcz no_clean"
+# Release: bcz rel no_clean
+# Output: bin/x64/Debug/
+```
+
+**Visual Studio F5 (debug):**
+- Set `CascadiaPackage` as startup project → F5
+- MSBuild copies `wta.exe` from Cargo output into the package layout
+  (via Content items in `CascadiaPackage.wapproj`)
+- The deployed `wta.exe` sits next to `WindowsTerminal.exe` in the
+  package directory, inheriting package identity for COM access
+
+### Full rebuild flow (typical dev cycle)
+
+```bash
+# 1. Build WTA
+taskkill //f //im wta.exe 2>/dev/null; true
+cargo build --manifest-path wta/Cargo.toml
+
+# 2. Build & run Terminal from VS
+#    F5 in Visual Studio (CascadiaPackage project)
+#    — or from command line:
+cmd.exe //c "tools\razzle.cmd && bcz no_clean"
+```
+
+### Package identity & COM
+
+The COM server (`TerminalProtocolComServer`) is registered under the
+Terminal's package identity. `wtcli.exe` and `wta.exe` must also have
+package identity to activate it via `CoCreateInstance`. This is why:
+
+- `wta.exe` is deployed **inside the package** (next to `WindowsTerminal.exe`)
+- `_DetectWtaPath()` prefers the co-located `wta.exe` over dev-build paths
+- Running `wta.exe` from `wta/target/debug/` directly will fail with
+  `0x80073D54` (APPMODEL_ERROR_NO_PACKAGE) when calling COM methods
+
+If autofix or the agent pane stops working after a debug launch, check
+`%TEMP%\wta-ensure-host.log` for the `0x80073D54` error — it means
+the wrong (unpackaged) `wta.exe` was used.
