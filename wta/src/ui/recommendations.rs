@@ -95,7 +95,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE).padding(Padding::zero()))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.rec_scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
 

@@ -1,13 +1,17 @@
 use ratatui::prelude::*;
 
-use crate::app::App;
+use crate::app::{App, AppMode};
 
-use super::{chat, debug_panel, input, permission, recommendations};
+use super::{chat, debug_panel, input, permission, recommendations, setup};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Split horizontally if debug panel is visible
+    if app.mode == AppMode::Setup {
+        setup::render(frame, app, area);
+        return;
+    }
+
     let (main_area, debug_area) = if app.show_debug_panel {
         let h = Layout::default()
             .direction(Direction::Horizontal)
@@ -18,40 +22,41 @@ pub fn render(frame: &mut Frame, app: &App) {
         (area, None)
     };
 
-    let recommendations_height = if app.recommendations.is_some() {
-        Constraint::Length(8)
+    let rec_height = if app.recommendations.is_some() {
+        Constraint::Length(app.rec_panel_height())
     } else {
         Constraint::Length(0)
     };
-
     let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width);
 
-    // Layout: recommendations | chat | input
+    // Layout: chat (history, always visible) | recommendations (popup above input) | input
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            recommendations_height,
-            Constraint::Min(1),            // chat area
+            Constraint::Min(1),          // chat — fills remaining space
+            rec_height,                  // recommendations — just above input
             Constraint::Length(input_height),
         ])
         .split(main_area);
 
-    recommendations::render(frame, app, chunks[0]);
-    chat::render(frame, app, chunks[1]);
+    chat::render(frame, app, chunks[0]);
+    recommendations::render(frame, app, chunks[1]);
     input::render(frame, app, chunks[2]);
 
-    // Debug panel (right side)
     if let Some(debug_area) = debug_area {
         debug_panel::render(frame, app, debug_area);
     }
 
-    // Permission modal overlay (rendered last, on top)
     if app.permission.is_some() {
         permission::render(frame, app, area);
     }
 }
 
 pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
+    if app.mode == AppMode::Setup {
+        return None;
+    }
+
     let main_area = if app.show_debug_panel {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -61,19 +66,18 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
         area
     };
 
-    let recommendations_height = if app.recommendations.is_some() {
-        Constraint::Length(8)
+    let rec_height = if app.recommendations.is_some() {
+        Constraint::Length(app.rec_panel_height())
     } else {
         Constraint::Length(0)
     };
-
     let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            recommendations_height,
             Constraint::Min(1),
+            rec_height,
             Constraint::Length(input_height),
         ])
         .split(main_area);

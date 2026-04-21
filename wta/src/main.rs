@@ -3,6 +3,7 @@ mod app;
 mod coordinator;
 mod event;
 mod logging;
+mod preflight;
 mod protocol;
 mod runtime_paths;
 mod shared_host;
@@ -14,6 +15,7 @@ mod ui_trace;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -1348,10 +1350,14 @@ async fn run_attach_tui(
 
     let autofix_enabled = !no_autofix;
 
+    // ── Preflight: check agent CLI before connecting to shared host ──
+    let preflight_result = preflight::check_agent(&agent).await;
+    let start_in_setup = !preflight_result.all_passed();
+
     // Set up the TUI.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1420,17 +1426,19 @@ async fn run_attach_tui(
             // Spawn the attach client (replaces run_acp_client in shared mode).
             // In attach mode, all prompts/recommendations/permissions are forwarded
             // to the shared host — no local ACP client or recommendation executor.
-            let attach_event_tx = event_tx.clone();
-            tokio::task::spawn_local(shared_host::run_attach_client(
-                host_pipe_name,
-                attach_event_tx,
-                prompt_rx,
-                recommendation_rx,
-                permission_rx,
-                pane_context,
-                initial_prompt,
-                debug_capture_enabled.clone(),
-            ));
+            if !start_in_setup {
+                let attach_event_tx = event_tx.clone();
+                tokio::task::spawn_local(shared_host::run_attach_client(
+                    host_pipe_name.clone(),
+                    attach_event_tx,
+                    prompt_rx,
+                    recommendation_rx,
+                    permission_rx,
+                    pane_context.clone(),
+                    initial_prompt.clone(),
+                    debug_capture_enabled.clone(),
+                ));
+            }
 
             let (_ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1438,11 +1446,18 @@ async fn run_attach_tui(
                 prompt_tx,
                 recommendation_tx,
                 permission_tx,
-                debug_capture_enabled,
+                debug_capture_enabled.clone(),
                 wt_connected,
                 true, // shared_mode
                 autofix_enabled,
             );
+
+            // If preflight failed, enter Setup mode with static guidance
+            // (no retry — user must close and reopen the agent pane).
+            if start_in_setup {
+                let _ = event_tx.send(app::AppEvent::PreflightComplete(preflight_result.clone()));
+            }
+
             if let Some((pane_id, tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);
                 app_state.tab_id = Some(tab_id);
@@ -1458,7 +1473,7 @@ async fn run_attach_tui(
         .await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -1559,7 +1574,7 @@ async fn run_acp_tui_mode(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1567,7 +1582,7 @@ async fn run_acp_tui_mode(
         run_acp_app(&mut terminal, cli, shell_mgr, wt_connected, debug_rx, pane_identity, wt_event_rx, wt_pipe_channel).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -1824,22 +1839,32 @@ async fn run_acp_app(
                 });
             }
 
-            let acp_event_tx = event_tx.clone();
+            // ── Preflight: check agent CLI availability before launching ──
+            let preflight_result = preflight::check_agent(&agent_cmd).await;
+            let start_in_setup = !preflight_result.all_passed();
+
             let shell_mgr_for_recs = Arc::clone(&shell_mgr);
-            let acp_initial_cwd = std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
-            tokio::task::spawn_local(protocol::acp::client::run_acp_client(
-                agent_cmd,
-                acp_event_tx,
-                prompt_rx,
-                shell_mgr,
-                wt_connected,
-                acp_initial_cwd,
-            ));
+
+            // Only spawn ACP client if preflight passed
+            if !start_in_setup {
+                let acp_event_tx = event_tx.clone();
+                let shell_mgr_clone = Arc::clone(&shell_mgr);
+                let agent_cmd_clone = agent_cmd.clone();
+                let acp_initial_cwd = std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
+                tokio::task::spawn_local(protocol::acp::client::run_acp_client(
+                    agent_cmd_clone,
+                    acp_event_tx,
+                    prompt_rx,
+                    shell_mgr_clone,
+                    wt_connected,
+                    acp_initial_cwd,
+                ));
+            }
 
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
             let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
             let debug_capture_enabled = Arc::new(AtomicBool::new(false));
-            let (ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Spawn the recommendation executor so selected choices actually run.
             let rec_event_tx = event_tx.clone();
@@ -1857,6 +1882,12 @@ async fn run_acp_app(
 
             let autofix_enabled = !cli.no_autofix;
             let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, debug_capture_enabled, wt_connected, false, autofix_enabled);
+
+            // If preflight failed, start in Setup mode
+            if start_in_setup {
+                let _ = event_tx.send(app::AppEvent::PreflightComplete(preflight_result));
+            }
+
             if let Some((pane_id, tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);
                 app_state.tab_id = Some(tab_id);

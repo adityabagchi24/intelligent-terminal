@@ -1,4 +1,4 @@
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{Event, EventStream, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
@@ -26,6 +26,11 @@ pub async fn read_crossterm_events(tx: mpsc::UnboundedSender<AppEvent>) {
                         AppEvent::Key(key)
                     }
                     Event::Resize(w, h) => AppEvent::Resize(w, h),
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => AppEvent::MouseScroll { delta: -3, row: mouse.row },
+                        MouseEventKind::ScrollDown => AppEvent::MouseScroll { delta: 3, row: mouse.row },
+                        _ => continue,
+                    },
                     _ => continue,
                 };
                 if tx.send(app_event).is_err() {

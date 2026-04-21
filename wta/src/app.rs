@@ -13,6 +13,7 @@ use crate::coordinator::{
     parse_recommendation_set, recommended_choice_index,
     validate_recommendation_set_for_coordinator_target, RecommendationChoice, RecommendationSet,
 };
+use crate::preflight::{CheckStatus, PreflightResult};
 use crate::protocol::acp::client::{prompt_timing_log, PromptSubmission};
 use crate::shared_host::SharedStateSnapshot;
 use crate::ui;
@@ -89,6 +90,25 @@ pub struct PermissionState {
     pub options: Vec<PermOption>,
     pub selected: usize,
     pub responder: Option<tokio::sync::oneshot::Sender<String>>,
+}
+
+// --- Setup / OOBE ---
+
+/// Application mode — controls which UI is shown.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppMode {
+    /// Normal agent chat.
+    Chat,
+    /// Setup wizard (agent not ready — CLI missing or not authenticated).
+    Setup,
+}
+
+/// State for the setup wizard screen.
+#[derive(Debug, Clone)]
+pub struct SetupState {
+    pub preflight: PreflightResult,
+    /// Which check row is currently selected (0 = CLI, 1 = Auth).
+    pub selected_index: usize,
 }
 
 // --- WT Event Notification ---
@@ -245,6 +265,8 @@ enum FinalizeOutcome {
 
 pub enum AppEvent {
     Key(KeyEvent),
+    /// Mouse wheel scroll: delta<0 = scroll up, delta>0 = scroll down, row = terminal row of event
+    MouseScroll { delta: i32, row: u16 },
     Tick,
     Resize(u16, u16), // terminal resize (handled by ratatui)
     ConnectionStage(String),
@@ -293,11 +315,15 @@ pub enum AppEvent {
         pane_id: String,
         params: serde_json::Value,
     },
+    /// Preflight checks completed — transition from Setup to Chat if all passed.
+    PreflightComplete(PreflightResult),
 }
 
 // --- App ---
 
 pub struct App {
+    pub mode: AppMode,
+    pub setup: Option<SetupState>,
     pub state: ConnectionState,
     pub agent_name: String,
     pub agent_model: Option<String>,
@@ -319,6 +345,9 @@ pub struct App {
     pub recommendations: Option<RecommendationSet>,
     pub selected_recommendation: usize,
     pub selected_button: usize, // 0 = Insert/left, 1 = Run/right (or 0 = sole button for OpenAndSend)
+    pub rec_scroll: usize,
+    pub terminal_rows: u16,
+    pub terminal_cols: u16,
     pub should_quit: bool,
     pub prompt_in_flight: bool,
     pub shared_mode: bool,
@@ -365,6 +394,8 @@ impl App {
         autofix_enabled: bool,
     ) -> Self {
         Self {
+            mode: AppMode::Chat,
+            setup: None,
             state: ConnectionState::Connecting("Starting agent...".to_string()),
             agent_name: String::new(),
             agent_model: None,
@@ -386,6 +417,9 @@ impl App {
             recommendations: None,
             selected_recommendation: 0,
             selected_button: 1, // default to "Run" button
+            rec_scroll: 0,
+            terminal_rows: 24,
+            terminal_cols: 80,
             should_quit: false,
             prompt_in_flight: false,
             shared_mode,
@@ -582,6 +616,7 @@ impl App {
     fn event_name(event: &AppEvent) -> &'static str {
         match event {
             AppEvent::Key(_) => "key",
+            AppEvent::MouseScroll { .. } => "mouse_scroll",
             AppEvent::Tick => "tick",
             AppEvent::Resize(_, _) => "resize",
             AppEvent::ConnectionStage(_) => "connection_stage",
@@ -605,6 +640,7 @@ impl App {
             AppEvent::DebugPipeMessage(_) => "debug_pipe_message",
             AppEvent::SharedStateSnapshot(_) => "shared_state_snapshot",
             AppEvent::WtEvent { .. } => "wt_event",
+            AppEvent::PreflightComplete(_) => "preflight_complete",
         }
     }
 
@@ -632,6 +668,40 @@ impl App {
     fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::MouseScroll { delta, row } => {
+                if self.recommendations.is_some() {
+                    // Route based on where the mouse is.
+                    // Recs panel sits just above the input (bottom of screen).
+                    let input_h: u16 = 3; // INPUT_MIN_HEIGHT
+                    let rec_h = self.rec_panel_height();
+                    let recs_top = self.terminal_rows.saturating_sub(input_h + rec_h);
+                    if row >= recs_top {
+                        // Mouse is in the recs area: scroll the recommendation panel.
+                        // Ratatui scroll(n,0) skips n lines from the top, so:
+                        //   delta>0 (wheel down) → show lower content → rec_scroll increases
+                        //   delta<0 (wheel up)   → show higher content → rec_scroll decreases
+                        if delta > 0 {
+                            self.rec_scroll = self.rec_scroll.saturating_add(delta as usize);
+                        } else {
+                            self.rec_scroll = self.rec_scroll.saturating_sub((-delta) as usize);
+                        }
+                    } else {
+                        // Mouse is in the chat area: scroll chat history.
+                        if delta < 0 {
+                            self.scroll_offset = self.scroll_offset.saturating_add((-delta) as usize);
+                        } else {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(delta as usize);
+                        }
+                    }
+                } else {
+                    // No recs visible — scroll chat.
+                    if delta < 0 {
+                        self.scroll_offset = self.scroll_offset.saturating_add((-delta) as usize);
+                    } else {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(delta as usize);
+                    }
+                }
+            }
             AppEvent::Tick => {
                 if self.has_activity_indicator() {
                     self.activity_frame = (self.activity_frame + 1) % 10; // Must match ACTIVITY_HIGHLIGHT_WINDOWS.len() in ui/chat.rs
@@ -647,7 +717,10 @@ impl App {
                     self.show_notification_banner = false;
                 }
             }
-            AppEvent::Resize(_, _) => {} // ratatui handles resize
+            AppEvent::Resize(w, h) => {
+                self.terminal_cols = w;
+                self.terminal_rows = h;
+            }
             AppEvent::ConnectionStage(stage) => {
                 self.state = ConnectionState::Connecting(stage);
             }
@@ -674,16 +747,72 @@ impl App {
                 self.prompt_name = Some(name);
             }
             AppEvent::AgentError(msg) => {
-                self.state = ConnectionState::Failed(msg.clone());
-                self.prompt_in_flight = false;
-                self.agent_streaming = false;
-                self.progress_status = None;
-                self.pending_thought_response.clear();
-                self.activity_frame = 0;
-                self.pending_agent_response.clear();
-                self.timing_note = None;
-                self.pending_completed_turn = None;
-                self.messages.push(ChatMessage::Error(msg));
+                // Check if this is an auth-related error — if so, show the
+                // Setup wizard with CLI ✓ and Auth ✗ instead of a raw error.
+                let lower = msg.to_ascii_lowercase();
+                let is_auth_error = lower.contains("auth")
+                    || lower.contains("login")
+                    || lower.contains("unauthorized")
+                    || lower.contains("401")
+                    || lower.contains("credentials");
+
+                if is_auth_error && self.mode != AppMode::Setup {
+                    // Extract agent id from the agent_name or fall back
+                    let agent_id = if self.agent_name.is_empty() {
+                        "copilot".to_string()
+                    } else {
+                        self.agent_name.to_ascii_lowercase()
+                    };
+                    let profile = crate::agent_registry::lookup_profile(&agent_id);
+
+                    // Build a preflight result with CLI passed, auth failed
+                    let auth_reason = msg
+                        .lines()
+                        .find(|l| {
+                            let ll = l.to_ascii_lowercase();
+                            ll.contains("auth") || ll.contains("login")
+                        })
+                        .unwrap_or("Not authenticated")
+                        .trim()
+                        .to_string();
+
+                    let preflight = PreflightResult {
+                        agent_id: profile.id.to_string(),
+                        display_name: profile.display_name.to_string(),
+                        cli_status: CheckStatus::Passed,
+                        cli_path: None,
+                        auth_status: CheckStatus::Failed(auth_reason),
+                        install_hint: profile.install_hint.to_string(),
+                        install_url: profile.install_url.to_string(),
+                        auth_hint: profile.auth_hint.to_string(),
+                    };
+
+                    self.mode = AppMode::Setup;
+                    self.setup = Some(SetupState {
+                        preflight,
+                        selected_index: 1, // select auth row
+                    });
+                    self.state = ConnectionState::Disconnected;
+                    self.prompt_in_flight = false;
+                    self.agent_streaming = false;
+                    self.progress_status = None;
+                    self.pending_thought_response.clear();
+                    self.activity_frame = 0;
+                    self.pending_agent_response.clear();
+                    self.timing_note = None;
+                    self.pending_completed_turn = None;
+                } else {
+                    self.state = ConnectionState::Failed(msg.clone());
+                    self.prompt_in_flight = false;
+                    self.agent_streaming = false;
+                    self.progress_status = None;
+                    self.pending_thought_response.clear();
+                    self.activity_frame = 0;
+                    self.pending_agent_response.clear();
+                    self.timing_note = None;
+                    self.pending_completed_turn = None;
+                    self.messages.push(ChatMessage::Error(msg));
+                }
             }
             AppEvent::ExecutionInfo(message) => {
                 self.push_execution_info(message);
@@ -699,7 +828,7 @@ impl App {
                         self.progress_status = Some("Thinking...".to_string());
                     }
                     append_thought_preview(&mut self.pending_thought_response, &text);
-                    self.scroll_to_bottom();
+                    // Don't auto-scroll during streaming — user can read at their own pace.
                 }
             }
             AppEvent::AgentMessageChunk(text) => {
@@ -712,7 +841,7 @@ impl App {
                     self.progress_status = None;
                     self.pending_thought_response.clear();
                     self.pending_agent_response.push_str(&text);
-                    self.scroll_to_bottom();
+                    // Don't auto-scroll during streaming — user can read at their own pace.
                 }
             }
             AppEvent::AgentMessageEnd => {
@@ -902,6 +1031,22 @@ impl App {
                     self.wt_notifications.pop_front();
                 }
             }
+            AppEvent::PreflightComplete(result) => {
+                if result.all_passed() {
+                    // All checks passed — transition to Chat mode
+                    self.mode = AppMode::Chat;
+                    self.setup = None;
+                    self.state = ConnectionState::Connecting("Starting agent...".to_string());
+                } else {
+                    // Show the setup wizard
+                    self.mode = AppMode::Setup;
+                    self.setup = Some(SetupState {
+                        preflight: result,
+                        selected_index: 0,
+                    });
+                    self.state = ConnectionState::Disconnected;
+                }
+            }
         }
     }
 
@@ -915,6 +1060,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // If in setup mode, route keys to setup handler
+        if self.mode == AppMode::Setup {
+            self.handle_setup_key(key);
+            return;
+        }
+
         // If permission modal is showing, route keys there
         if let Some(ref mut perm) = self.permission {
             match key.code {
@@ -974,14 +1125,16 @@ impl App {
             KeyCode::Up if self.input.is_empty() && self.recommendations.is_some() => {
                 if self.selected_recommendation > 0 {
                     self.selected_recommendation -= 1;
-                    self.selected_button = 1; // reset to Run on card change
+                    self.selected_button = self.default_button_for_selected();
+                    self.scroll_rec_to_selected();
                 }
             }
             KeyCode::Down if self.input.is_empty() && self.recommendations.is_some() => {
                 if let Some(recs) = &self.recommendations {
                     if self.selected_recommendation + 1 < recs.choices.len() {
                         self.selected_recommendation += 1;
-                        self.selected_button = 1; // reset to Run on card change
+                        self.selected_button = self.default_button_for_selected();
+                        self.scroll_rec_to_selected();
                     }
                 }
             }
@@ -1133,6 +1286,45 @@ impl App {
         }
     }
 
+    fn handle_setup_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            KeyCode::Esc => {
+                self.should_quit = true;
+            }
+            KeyCode::Enter => {
+                // Open install URL based on selected row
+                if let Some(ref setup) = self.setup {
+                    if setup.selected_index == 0
+                        && setup.preflight.cli_status != CheckStatus::Passed
+                    {
+                        let url = setup.preflight.install_url.clone();
+                        if !url.is_empty() {
+                            let _ = open_url_in_browser(&url);
+                        }
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if let Some(ref mut setup) = self.setup {
+                    if setup.selected_index > 0 {
+                        setup.selected_index -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(ref mut setup) = self.setup {
+                    if setup.selected_index < 1 {
+                        setup.selected_index += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -1210,10 +1402,54 @@ impl App {
         self.cursor_pos = next_char_boundary(&self.input, self.cursor_pos);
     }
 
+    /// Height of the recommendations panel — grows to fit content, capped at 40% of pane height.
+    pub fn rec_panel_height(&self) -> u16 {
+        let recs = match self.recommendations.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        // Compute actual total height based on real card content (accounts for wrapped code).
+        let panel_width = self.terminal_cols;
+        let total_needed: u16 = recs
+            .choices
+            .iter()
+            .map(|c| rec_card_height(c, panel_width) as u16)
+            .sum::<u16>()
+            .saturating_add(1); // hint line
+        // Leave at least 3 rows for chat + 3 for input.
+        let max = self.terminal_rows.saturating_sub(6).max(8);
+        total_needed.min(max).max(8)
+    }
+
     fn clear_recommendations(&mut self) {
         self.recommendations = None;
         self.selected_recommendation = 0;
         self.selected_button = 1;
+        self.rec_scroll = 0;
+    }
+
+    /// Adjusts rec_scroll so the selected recommendation card's title is at the top of the panel.
+    fn scroll_rec_to_selected(&mut self) {
+        let panel_height = self.rec_panel_height() as usize; // actual panel size, not full pane
+        let panel_width = self.terminal_cols;
+        let Some(recs) = self.recommendations.clone() else { return };
+
+        // Accumulate line offsets to find the exact top of the selected card.
+        let mut line_top: usize = 0;
+        for (idx, choice) in recs.choices.iter().enumerate() {
+            let card_h = rec_card_height(choice, panel_width);
+            if idx == self.selected_recommendation {
+                // Scroll so title is at the top; if the card fits, keep it fully visible.
+                let card_bottom = line_top + card_h;
+                if line_top < self.rec_scroll {
+                    self.rec_scroll = line_top;
+                } else if card_bottom > self.rec_scroll + panel_height {
+                    self.rec_scroll = line_top;
+                }
+                return;
+            }
+            line_top += card_h;
+        }
     }
 
     pub fn history_navigation_enabled(&self) -> bool {
@@ -1606,6 +1842,12 @@ impl App {
             .unwrap_or(1)
     }
 
+    /// Default focused button index when landing on a card.
+    /// Send cards default to Run (index 1); OpenAndSend cards have only index 0.
+    fn default_button_for_selected(&self) -> usize {
+        if self.button_count_for_selected() > 1 { 1 } else { 0 }
+    }
+
     /// Returns true if the choice's primary action is Send (shell command).
     fn is_send_choice(&self, choice: &RecommendationChoice) -> bool {
         choice.actions.iter().any(|a| matches!(a, crate::coordinator::RecommendedAction::Send { .. }))
@@ -1685,6 +1927,55 @@ impl App {
     }
 
     fn apply_shared_snapshot(&mut self, snapshot: SharedStateSnapshot) {
+        // Check if the snapshot contains an auth-related error — if so,
+        // switch to Setup wizard instead of showing a raw error.
+        if let ConnectionState::Failed(ref msg) = snapshot.state {
+            let lower = msg.to_ascii_lowercase();
+            let is_auth_error = lower.contains("auth")
+                || lower.contains("login")
+                || lower.contains("unauthorized")
+                || lower.contains("401")
+                || lower.contains("credentials");
+
+            if is_auth_error && self.mode != AppMode::Setup {
+                let agent_id = if snapshot.agent_name.is_empty() {
+                    "copilot".to_string()
+                } else {
+                    snapshot.agent_name.to_ascii_lowercase()
+                };
+                let profile = crate::agent_registry::lookup_profile(&agent_id);
+
+                let auth_reason = msg
+                    .lines()
+                    .find(|l| {
+                        let ll = l.to_ascii_lowercase();
+                        ll.contains("auth") || ll.contains("login")
+                    })
+                    .unwrap_or("Not authenticated")
+                    .trim()
+                    .to_string();
+
+                let preflight = PreflightResult {
+                    agent_id: profile.id.to_string(),
+                    display_name: profile.display_name.to_string(),
+                    cli_status: CheckStatus::Passed,
+                    cli_path: None,
+                    auth_status: CheckStatus::Failed(auth_reason),
+                    install_hint: profile.install_hint.to_string(),
+                    install_url: profile.install_url.to_string(),
+                    auth_hint: profile.auth_hint.to_string(),
+                };
+
+                self.mode = AppMode::Setup;
+                self.setup = Some(SetupState {
+                    preflight,
+                    selected_index: 1,
+                });
+                self.state = ConnectionState::Disconnected;
+                return;
+            }
+        }
+
         let recommendations_changed = self.recommendations != snapshot.recommendations;
         let completed_turns_changed = self.completed_turns != snapshot.completed_turns;
         let permission_changed = self
@@ -1785,6 +2076,35 @@ impl App {
 }
 
 const THOUGHT_PREVIEW_MAX_CHARS: usize = 1024;
+
+/// Computes the rendered height (in terminal rows) of a recommendation card.
+///
+/// Card structure: title + top border + content lines + separator + buttons + bottom border + blank
+/// Content lines wrap based on the inner width of the card.
+fn rec_card_height(choice: &RecommendationChoice, panel_width: u16) -> usize {
+    use crate::coordinator::RecommendedAction;
+    // inner_width = panel_width - 2 (indent) - 2 (border chars) - 2 (padding inside border)
+    let inner_width = (panel_width as usize).saturating_sub(6).max(1);
+
+    let text = choice.actions.iter().find_map(|action| match action {
+        RecommendedAction::Send { input, .. } => Some(input.clone()),
+        RecommendedAction::OpenAndSend { agent, input, .. } => {
+            let label = agent.as_deref().unwrap_or("agent");
+            Some(format!("{}: {}", label, input))
+        }
+    }).unwrap_or_else(|| choice.title.clone());
+
+    let content_lines: usize = text.lines()
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 { 1 } else { chars.div_ceil(inner_width) }
+        })
+        .sum::<usize>()
+        .max(1);
+
+    // title(1) + top_border(1) + content + separator(1) + buttons(1) + bottom_border(1) + blank(1)
+    6 + content_lines
+}
 
 fn append_thought_preview(buffer: &mut String, chunk: &str) {
     if chunk.is_empty() {
@@ -1892,6 +2212,14 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
 }
 
+
+/// Open a URL in the default browser (Windows).
+fn open_url_in_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn()?;
+    Ok(())
+}
 
 fn now_unix_s() -> f64 {
     std::time::SystemTime::now()

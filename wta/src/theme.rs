@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 // Colors matching AcpConnection.cpp ANSI codes
-pub const USER_PROMPT: Style = Style::new().fg(Color::Green);
+pub const USER_PROMPT: Style = Style::new().fg(Color::DarkGray);
 pub const INPUT_TEXT: Style = Style::new().fg(Color::White);
 pub const AGENT_TEXT: Style = Style::new().fg(Color::White);
 pub const SYSTEM_TEXT: Style = Style::new().fg(Color::Cyan);
@@ -37,7 +37,7 @@ pub const BUTTON_FOCUSED: Style = Style::new()
     .add_modifier(Modifier::BOLD);
 // Chat message dot indicators
 pub const DOT_ERROR: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
-pub const DOT_AGENT: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+pub const DOT_AGENT: Style = Style::new().fg(Color::DarkGray);
 // Notification badge/banner styles
 pub const BADGE_CRITICAL: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 pub const BADGE_ACTIONABLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);

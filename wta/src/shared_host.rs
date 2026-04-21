@@ -269,8 +269,9 @@ impl SharedUiEvent {
             | AppEvent::DebugPipeMessage(_)
             | AppEvent::SharedStateSnapshot(_)
             | AppEvent::SharedPermissionRequest { .. }
-            | AppEvent::PermissionCleared => None,
-            AppEvent::UserMessage(_) => None,
+            | AppEvent::PermissionCleared
+            | AppEvent::PreflightComplete(_) => None,
+            AppEvent::UserMessage(_) | AppEvent::MouseScroll { .. } => None,
         }
     }
 
@@ -593,6 +594,11 @@ pub async fn run_host_server(
         delegate_agent_runtimes,
     ));
 
+    // Launch ACP client directly. Pre-flight gating is done on the attach
+    // TUI side — the setup wizard prevents users from connecting to the
+    // shared host until the agent CLI is installed. If the CLI is missing
+    // here the spawn will fail and surface as an AgentError to any attached
+    // client.
     let initial_cwd = std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
     tokio::task::spawn_local(run_acp_client(
         agent_cmd,
@@ -1767,8 +1773,10 @@ impl HostSessionState {
             | AppEvent::UserMessage(_)
             | AppEvent::SharedPermissionRequest { .. }
             | AppEvent::PermissionCleared
+            | AppEvent::PreflightComplete(_)
             | AppEvent::Tick
             | AppEvent::Key(_)
+            | AppEvent::MouseScroll { .. }
             | AppEvent::Resize(_, _)
             | AppEvent::DebugPipeMessage(_)
             | AppEvent::SharedStateSnapshot(_) => {}
