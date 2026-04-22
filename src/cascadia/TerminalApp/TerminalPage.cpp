@@ -3252,12 +3252,8 @@ namespace winrt::TerminalApp::implementation
         _diagnostics.unacknowledgedErrors++;
         _diagnostics.lastErrorPaneId = paneId;
         _diagnostics.lastErrorSummary = summary;
-        // Optimistically flip to Pending — WTA will upgrade to Armed once
-        // the agent has a concrete fix, or back to Idle via autofix_state:cleared.
-        if (_diagnostics.autofixState == AutofixState::Idle)
-        {
-            _diagnostics.autofixState = AutofixState::Pending;
-        }
+        // State transitions are driven exclusively by WTA via OnAutofixStateChanged.
+        // We just record the error here; WTA will send pending/armed/cleared events.
         _UpdateBottomBarState();
     }
 
@@ -3341,12 +3337,7 @@ namespace winrt::TerminalApp::implementation
             *this,
             winrt::to_hstring(Json::writeString(wb, evt)));
 
-        // Optimistically return to Idle. WTA will also emit autofix_state:cleared
-        // but flipping immediately avoids a double-click racing the round trip.
-        _diagnostics.autofixState = AutofixState::Idle;
-        _diagnostics.unacknowledgedErrors = 0;
-        _diagnostics.fixPreview.clear();
-        _UpdateBottomBarState();
+        // WTA will emit autofix_state:cleared — OnAutofixStateChanged handles the transition.
     }
 
     void TerminalPage::_PopulateAgentSelectorFlyout()
@@ -3809,6 +3800,7 @@ namespace winrt::TerminalApp::implementation
                                                                    widePaneId, exitCode);
                                         page->_IncrementDiagnosticErrors(widePaneId, summary);
                                     }
+                                    // exit_code=0 is handled by WTA via autofix_state:cleared event.
                                 }
                             }
 

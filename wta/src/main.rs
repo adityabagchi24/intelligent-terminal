@@ -1258,6 +1258,27 @@ async fn run_ensure_host(
                                 },
                             );
                         }
+                        // A successful command in an armed pane means the error was
+                        // resolved without the fix. Dismiss the autofix state.
+                        if method == "vt_sequence"
+                            && note.severity == crate::app::WtEventSeverity::Informational
+                        {
+                            if let Some(seq) = params.get("sequence").and_then(|v| v.as_str()) {
+                                let is_exit_zero = seq.strip_prefix("osc:133;")
+                                    .and_then(|rest| rest.strip_prefix("D;"))
+                                    .and_then(|code| code.trim().parse::<i32>().ok())
+                                    .map(|c| c == 0)
+                                    .unwrap_or(false);
+                                if is_exit_zero {
+                                    tracing::info!(pane_id = %pane_id, "host autofix clear on success");
+                                    let _ = host_autofix_tx.send(
+                                        shared_host::HostAutofixCommand::ClearOnSuccess {
+                                            pane_id: pane_id.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 });
             }

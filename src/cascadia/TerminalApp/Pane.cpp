@@ -3394,11 +3394,6 @@ winrt::Windows::UI::Xaml::Media::SolidColorBrush Pane::_ComputeBorderColor()
         return _themeResources.focusedBorderBrush;
     }
 
-    if (_isSourceOfAgentPane)
-    {
-        return _themeResources.focusedBorderBrush;
-    }
-
     if (_broadcastEnabled && (_IsLeaf() && !_content.ReadOnly()))
     {
         return _themeResources.broadcastBorderBrush;

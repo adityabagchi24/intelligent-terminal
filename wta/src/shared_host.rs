@@ -465,6 +465,10 @@ pub enum HostAutofixCommand {
     Execute {
         pane_id: String,
     },
+    /// A command succeeded in `pane_id` — dismiss any armed/pending autofix for that pane.
+    ClearOnSuccess {
+        pane_id: String,
+    },
 }
 
 pub async fn run_host_server(
@@ -572,6 +576,13 @@ pub async fn run_host_server(
                                 source_pane_id: pane_id,
                             },
                         });
+                    }
+                    HostAutofixCommand::ClearOnSuccess { pane_id } => {
+                        host_log(&format!(
+                            "autofix_clear_on_success: pane={} attach_count={}",
+                            pane_id, active_attaches
+                        ));
+                        let _ = command_tx.send(HostCommand::ClearAutofixForPane { pane_id });
                     }
                 }
             }
@@ -992,6 +1003,34 @@ fn handle_host_command(
         HostCommand::DetachClient { client_id } => {
             clients.remove(&client_id);
         }
+        HostCommand::ClearAutofixForPane { pane_id } => {
+            let armed_pane = state
+                .current_prompt_pane_context
+                .as_ref()
+                .and_then(|c| c.source_pane_id.as_deref());
+            let matches = state.current_prompt_is_autofix && armed_pane == Some(pane_id.as_str());
+            // Also clear if there are armed recommendations for this pane,
+            // even if prompt is no longer in-flight.
+            let has_armed_recs = state.recommendations.is_some()
+                && !state.current_prompt_is_autofix
+                && armed_pane == Some(pane_id.as_str());
+            if matches || has_armed_recs {
+                // Bump generation to stale any still-running agent response.
+                state.autofix_generation = state.autofix_generation.wrapping_add(1);
+                state.inflight_autofix_generation = None;
+                let cleared_evt = serde_json::json!({
+                    "type": "event",
+                    "method": "autofix_state",
+                    "params": { "state": "cleared", "pane_id": pane_id }
+                });
+                crate::app::send_wt_protocol_event(cleared_evt.to_string());
+                state.recommendations = None;
+                state.current_prompt_is_autofix = false;
+                // Clear context so a still-running agent response won't re-arm.
+                state.current_prompt_pane_context = None;
+                broadcast_snapshot(clients, &state.snapshot());
+            }
+        }
         HostCommand::ClientRequest { client_id, request } => match request {
             HostClientRequest::GetSnapshot => {
                 send_to_client(
@@ -1028,6 +1067,33 @@ fn handle_host_command(
                         .get(&client_id)
                         .map(|client| client.pane_context.clone())
                 };
+
+                // For autofix prompts: latest-event-wins semantics.
+                if is_autofix {
+                    let incoming_pane = effective_context
+                        .as_ref()
+                        .and_then(|c: &PaneContext| c.source_pane_id.as_deref());
+                    let same_pane_pending = {
+                        let current_pane = state
+                            .current_prompt_pane_context
+                            .as_ref()
+                            .and_then(|c| c.source_pane_id.as_deref());
+                        state.prompt_in_flight
+                            && state.current_prompt_is_autofix
+                            && incoming_pane.is_some()
+                            && incoming_pane == current_pane
+                    };
+                    if same_pane_pending {
+                        // Bridge already emitted pending with the new summary.
+                        // Agent is still working — don't send a duplicate prompt.
+                        return;
+                    }
+                    // Bump generation to stale any existing in-flight autofix response.
+                    state.autofix_generation = state.autofix_generation.wrapping_add(1);
+                    state.inflight_autofix_generation = Some(state.autofix_generation);
+                    // Clear any armed recommendations from a previous error.
+                    state.recommendations = None;
+                }
 
                 state.record_prompt_submission(
                     text.clone(),
@@ -1076,6 +1142,12 @@ fn handle_host_command(
                             message: "agent prompt loop is unavailable".to_string(),
                         },
                     );
+                }
+                // For autofix prompts, broadcast a snapshot immediately so
+                // the attach TUI sees recommendations=None and prompt_in_flight=true
+                // right away — without waiting for the first agent chunk to arrive.
+                if is_autofix {
+                    broadcast_snapshot(clients, &state.snapshot());
                 }
             }
             HostClientRequest::SelectRecommendation { choice, insert_only } => {
@@ -1442,6 +1514,10 @@ enum HostCommand {
     DetachClient {
         client_id: u64,
     },
+    /// Dismiss armed/pending autofix for a pane because a successful command ran there.
+    ClearAutofixForPane {
+        pane_id: String,
+    },
 }
 
 struct HostSessionState {
@@ -1463,6 +1539,10 @@ struct HostSessionState {
     // attach TUI isn't running (agent pane closed / never opened).
     current_prompt_is_autofix: bool,
     current_prompt_submitted_at_unix_s: Option<f64>,
+    // Generation counter for cancel semantics: incremented on every new trigger
+    // or explicit cancel. AgentMessageEnd responses that don't match are discarded.
+    autofix_generation: u64,
+    inflight_autofix_generation: Option<u64>,
     pending_completed_turn: Option<CompletedTurn>,
     agent_streaming: bool,
     pending_thought_response: String,
@@ -1492,6 +1572,8 @@ impl HostSessionState {
             current_prompt_text: None,
             current_prompt_is_autofix: false,
             current_prompt_submitted_at_unix_s: None,
+            autofix_generation: 0,
+            inflight_autofix_generation: None,
             pending_completed_turn: None,
             agent_streaming: false,
             pending_thought_response: String::new(),
@@ -1706,10 +1788,22 @@ impl HostSessionState {
                 self.bump();
             }
             AppEvent::AgentMessageEnd => {
+                // Check if this autofix response was superseded by a newer trigger or cancel.
+                let is_stale_autofix = match self.inflight_autofix_generation {
+                    Some(gen) => gen != self.autofix_generation,
+                    None => false,
+                };
                 self.agent_streaming = false;
                 self.prompt_in_flight = false;
                 self.progress_status = None;
                 self.pending_thought_response.clear();
+                self.inflight_autofix_generation = None;
+                if is_stale_autofix {
+                    tracing::info!(target: "autofix", "shared_host: discarding stale autofix response");
+                    self.pending_agent_response.clear();
+                    self.bump();
+                    return;
+                }
                 if let Some(summary) = self.completion_latency_summary() {
                     self.push_execution_info(summary);
                 }

@@ -377,10 +377,15 @@ pub struct App {
     // WT event notifications
     pub wt_notifications: std::collections::VecDeque<WtNotification>,
     pub show_notification_banner: bool,
-    // Auto-fix: timestamp of last auto-fix prompt to debounce rapid errors
     // Auto-fix: the pane ID where the error occurred (used to auto-fill Send parent)
     pub autofix_pane_id: Option<String>,
     pub autofix_enabled: bool,
+    // Generation counter: incremented on every new trigger or cancel.
+    // AgentMessageEnd responses whose generation doesn't match are discarded.
+    autofix_generation: u64,
+    // Generation captured when the current in-flight autofix prompt was sent.
+    // None means the in-flight prompt is not an autofix prompt.
+    inflight_autofix_generation: Option<u64>,
 }
 
 impl App {
@@ -447,6 +452,8 @@ impl App {
             show_notification_banner: false,
             autofix_pane_id: None,
             autofix_enabled,
+            autofix_generation: 0,
+            inflight_autofix_generation: None,
         }
     }
 
@@ -845,12 +852,32 @@ impl App {
                 }
             }
             AppEvent::AgentMessageEnd => {
+                // Check if this response is stale (generation bumped since we sent).
+                let is_stale_autofix = match self.inflight_autofix_generation {
+                    Some(gen) => gen != self.autofix_generation,
+                    None => false,
+                };
+
+                if is_stale_autofix {
+                    // Discard: a newer error or cancel superseded this response.
+                    tracing::info!(target: "autofix", inflight_gen = ?self.inflight_autofix_generation, current_gen = self.autofix_generation, "discarding stale autofix response");
+                    self.agent_streaming = false;
+                    self.prompt_in_flight = false;
+                    self.progress_status = None;
+                    self.pending_thought_response.clear();
+                    self.pending_agent_response.clear();
+                    self.activity_frame = 0;
+                    self.inflight_autofix_generation = None;
+                    return;
+                }
+
                 // Always reset streaming flags so autofix guards don't get stuck.
                 self.agent_streaming = false;
                 self.prompt_in_flight = false;
                 self.progress_status = None;
                 self.pending_thought_response.clear();
                 self.activity_frame = 0;
+                self.inflight_autofix_generation = None;
 
                 if !self.shared_mode {
                     // Only the non-shared client finalizes the response locally.
@@ -1021,7 +1048,26 @@ impl App {
                         self.maybe_trigger_autofix(&notification);
                     }
                     WtEventSeverity::Informational => {
-                        // Informational events only show in status bar, no chat message
+                        // A successful command (exit 0) in the armed/pending pane
+                        // means the error was resolved. Cancel any in-flight fix and dismiss.
+                        if method == "vt_sequence" {
+                            let seq = params.get("sequence").and_then(|v| v.as_str()).unwrap_or("");
+                            let is_exit_zero = seq.strip_prefix("osc:133;")
+                                .and_then(|rest| rest.strip_prefix("D;"))
+                                .and_then(|code| code.trim().parse::<i32>().ok())
+                                .map(|c| c == 0)
+                                .unwrap_or(false);
+                            if is_exit_zero && self.autofix_pane_id.as_deref() == Some(pane_id.as_str()) {
+                                self.autofix_generation = self.autofix_generation.wrapping_add(1);
+                                let pane = self.autofix_pane_id.take().unwrap();
+                                self.clear_recommendations();
+                                self.prompt_in_flight = false;
+                                self.agent_streaming = false;
+                                self.progress_status = None;
+                                self.inflight_autofix_generation = None;
+                                self.emit_autofix_state_cleared(&pane);
+                            }
+                        }
                     }
                 }
 
@@ -1183,6 +1229,22 @@ impl App {
             }
             KeyCode::Esc if self.show_notification_banner => {
                 self.dismiss_notifications();
+            }
+            KeyCode::Esc
+                if self.recommendations.is_some()
+                    || (self.autofix_pane_id.is_some() && self.prompt_in_flight) =>
+            {
+                // Dismiss armed fix card or cancel in-flight autofix request.
+                self.autofix_generation = self.autofix_generation.wrapping_add(1);
+                let pane = self.autofix_pane_id.take();
+                self.clear_recommendations();
+                self.prompt_in_flight = false;
+                self.agent_streaming = false;
+                self.progress_status = None;
+                self.inflight_autofix_generation = None;
+                if let Some(p) = pane {
+                    self.emit_autofix_state_cleared(&p);
+                }
             }
             KeyCode::Esc if self.input.is_empty() => {
                 self.collapse_selected_history_turn();
@@ -1562,11 +1624,31 @@ impl App {
         if !self.autofix_enabled {
             return;
         }
-        // Only trigger when the agent is connected and idle
-        if self.state != ConnectionState::Connected || self.agent_streaming || self.prompt_in_flight
-        {
+        if self.state != ConnectionState::Connected {
             return;
         }
+
+        // Latest event always wins. If we're Pending/Armed for a different
+        // pane, or Armed for the same pane, bump the generation to invalidate
+        // any in-flight response and start fresh.
+        let same_pane = self.autofix_pane_id.as_deref() == Some(notification.pane_id.as_str());
+
+        if same_pane && self.prompt_in_flight {
+            // Same pane, already Pending: re-emit pending with new summary
+            // but don't send another prompt (agent is already working on it).
+            tracing::info!(target: "autofix", pane_id = %notification.pane_id, "autofix re-trigger same pane while pending — re-emit only");
+            self.messages.push(ChatMessage::Error(notification.summary.clone()));
+            self.scroll_to_bottom();
+            self.emit_autofix_state_pending(&notification.pane_id, &notification.summary);
+            return;
+        }
+
+        // For all other cases (different pane, or Armed state, or Idle):
+        // bump generation to stale any in-flight response, clear current state.
+        self.autofix_generation = self.autofix_generation.wrapping_add(1);
+        self.clear_recommendations();
+        self.agent_streaming = false;
+        self.prompt_in_flight = false;
 
         // The auto-fix kind is carried by PromptSubmission::is_autofix,
         // so the text doesn't need a marker prefix — just the raw error
@@ -1598,6 +1680,7 @@ impl App {
         self.messages
             .push(ChatMessage::Error(notification.summary.clone()));
         self.prompt_in_flight = true;
+        self.inflight_autofix_generation = Some(self.autofix_generation);
         self.progress_status = Some("Preparing context...".to_string());
         self.activity_frame = 0;
         self.scroll_to_bottom();
@@ -1605,7 +1688,7 @@ impl App {
         let prompt = PromptSubmission::new_autofix(prompt_text, Some(pane_context));
         self.current_prompt_id = Some(prompt.id);
         self.current_prompt_submitted_at_unix_s = Some(prompt.submitted_at_unix_s);
-        tracing::info!(target: "autofix", pane_id = %notification.pane_id, "sending auto-fix prompt");
+        tracing::info!(target: "autofix", pane_id = %notification.pane_id, generation = self.autofix_generation, "sending auto-fix prompt");
         let _ = self.prompt_tx.send(prompt);
 
         // Light up the bottom-bar diagnostic icon in "Pending" state — the
@@ -1904,7 +1987,7 @@ impl App {
                 // If this was an auto-fix that couldn't be parsed into
                 // actions, clear the bottom-bar state so the user isn't
                 // left staring at a Pending icon forever.
-                if let Some(pane_id) = self.autofix_pane_id.clone() {
+                if let Some(pane_id) = self.autofix_pane_id.take() {
                     self.emit_autofix_state_cleared(&pane_id);
                 }
                 // For normal (user-driven) prompts we wrap the failed
