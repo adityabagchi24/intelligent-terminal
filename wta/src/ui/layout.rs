@@ -1,8 +1,7 @@
 use ratatui::prelude::*;
-
 use crate::app::{App, AppMode};
 
-use super::{chat, debug_panel, input, permission, recommendations, setup};
+use super::{chat, debug_panel, input, permission, recommendations, setup, title_bar};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -27,17 +26,40 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         Constraint::Length(0)
     };
-    let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width);
+    let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width.saturating_sub(2));
 
-    // Layout: chat (history, always visible) | recommendations (popup above input) | input
+    // Outer vertical split: title bar (full width) | content below
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(title_bar::HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(main_area);
+
+    title_bar::render(frame, app, v_chunks[0]);
+
+    // Horizontal margin for the content area (restore padding removed from the profile)
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(1), // left padding
+            Constraint::Min(0),
+            Constraint::Length(1), // right padding
+        ])
+        .split(v_chunks[1]);
+
+    let content_area = h_chunks[1];
+
+    // Vertical split for chat | recommendations | input within padded area
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),          // chat — fills remaining space
-            rec_height,                  // recommendations — just above input
+            Constraint::Min(1),
+            rec_height,
             Constraint::Length(input_height),
         ])
-        .split(main_area);
+        .split(content_area);
 
     chat::render(frame, app, chunks[0]);
     recommendations::render(frame, app, chunks[1]);
@@ -71,7 +93,26 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
     } else {
         Constraint::Length(0)
     };
-    let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width);
+    let input_height = input::input_height(&app.input, app.cursor_pos, main_area.width.saturating_sub(2));
+
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(title_bar::HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(main_area);
+
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(v_chunks[1]);
+
+    let content_area = h_chunks[1];
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -80,7 +121,7 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
             rec_height,
             Constraint::Length(input_height),
         ])
-        .split(main_area);
+        .split(content_area);
 
     input::cursor_position(app, chunks[2])
 }

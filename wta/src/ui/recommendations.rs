@@ -89,7 +89,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // Hint line
     lines.push(Line::from(Span::styled(
-        "↑↓: switch | ←→: button | Enter: activate | Esc: dismiss",
+        "Enter: activate | Esc: dismiss",
         theme::DIM,
     )));
 

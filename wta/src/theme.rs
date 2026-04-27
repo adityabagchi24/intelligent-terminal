@@ -1,5 +1,9 @@
 use ratatui::style::{Color, Modifier, Style};
 
+/// Title bar background — noticeably lighter than the #0c0c0c pane background.
+pub const PANEL_BG: Color = Color::Rgb(30, 30, 30);
+pub const PANEL_STYLE: Style = Style::new().bg(PANEL_BG);
+
 // Colors matching AcpConnection.cpp ANSI codes
 pub const USER_PROMPT: Style = Style::new().fg(Color::DarkGray);
 pub const INPUT_TEXT: Style = Style::new().fg(Color::White);

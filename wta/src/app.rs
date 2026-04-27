@@ -320,6 +320,17 @@ pub enum AppEvent {
     PreflightComplete(PreflightResult),
 }
 
+// --- Per-tab session storage ---
+
+#[derive(Default)]
+struct TabSession {
+    messages: Vec<ChatMessage>,
+    completed_turns: Vec<CompletedTurn>,
+    selected_history: Option<usize>,
+    expanded_history: Option<usize>,
+    scroll_offset: usize,
+}
+
 // --- App ---
 
 pub struct App {
@@ -386,6 +397,8 @@ pub struct App {
     // Generation captured when the current in-flight autofix prompt was sent.
     // None means the in-flight prompt is not an autofix prompt.
     inflight_autofix_generation: Option<u64>,
+    // Per-tab conversation sessions. Keyed by tab_id string (0-based index).
+    tab_sessions: HashMap<String, TabSession>,
 }
 
 impl App {
@@ -452,6 +465,7 @@ impl App {
             autofix_enabled,
             autofix_generation: 0,
             inflight_autofix_generation: None,
+            tab_sessions: HashMap::new(),
         }
     }
 
@@ -965,6 +979,29 @@ impl App {
                 // actually have a cached autofix for that pane.
                 if method == "autofix_execute" {
                     self.handle_autofix_execute_request(&pane_id);
+                    return;
+                }
+
+                if method == "tab_changed" {
+                    tracing::info!(
+                        target: "tab_session",
+                        raw_params = %params,
+                        current_tab = ?self.tab_id,
+                        "tab_changed event received"
+                    );
+                    if let Some(new_tab_id) = params.get("tab_id").and_then(|v| v.as_str()) {
+                        // If discover_pane_identity failed at startup, self.tab_id is None.
+                        // Use from_tab_id (sent by C++) to initialize it before saving.
+                        if self.tab_id.is_none() {
+                            if let Some(from_id) = params.get("from_tab_id").and_then(|v| v.as_str()) {
+                                tracing::info!(target: "tab_session", from_tab_id = from_id, "initializing tab_id from from_tab_id");
+                                self.tab_id = Some(from_id.to_string());
+                            }
+                        }
+                        self.switch_tab_session(new_tab_id.to_string());
+                    } else {
+                        tracing::warn!(target: "tab_session", "tab_changed: missing tab_id in params");
+                    }
                     return;
                 }
 
@@ -1496,6 +1533,50 @@ impl App {
         self.expanded_history == Some(index)
     }
 
+    fn switch_tab_session(&mut self, new_tab_id: String) {
+        let old_tab = self.tab_id.clone();
+        tracing::info!(
+            target: "tab_session",
+            from = ?old_tab,
+            to = %new_tab_id,
+            completed_turns = self.completed_turns.len(),
+            messages = self.messages.len(),
+            "switch_tab_session"
+        );
+
+        if let Some(ref cur) = old_tab {
+            if *cur != new_tab_id {
+                let s = self.tab_sessions.entry(cur.clone()).or_default();
+                s.messages = std::mem::take(&mut self.messages);
+                s.completed_turns = std::mem::take(&mut self.completed_turns);
+                s.selected_history = self.selected_history.take();
+                s.expanded_history = self.expanded_history.take();
+                s.scroll_offset = self.scroll_offset;
+                tracing::info!(
+                    target: "tab_session",
+                    tab = %cur,
+                    saved_turns = s.completed_turns.len(),
+                    "saved session"
+                );
+            }
+        }
+
+        let loaded = self.tab_sessions.remove(&new_tab_id).unwrap_or_default();
+        tracing::info!(
+            target: "tab_session",
+            tab = %new_tab_id,
+            loaded_turns = loaded.completed_turns.len(),
+            "loaded session"
+        );
+        self.messages = loaded.messages;
+        self.completed_turns = loaded.completed_turns;
+        self.selected_history = loaded.selected_history;
+        self.expanded_history = loaded.expanded_history;
+        self.scroll_offset = loaded.scroll_offset;
+
+        self.tab_id = Some(new_tab_id);
+    }
+
     fn clear_chat_history(&mut self) {
         self.messages.clear();
         self.tool_calls.clear();
@@ -1599,8 +1680,6 @@ impl App {
             // Same pane, already Pending: re-emit pending with new summary
             // but don't send another prompt (agent is already working on it).
             tracing::info!(target: "autofix", pane_id = %notification.pane_id, "autofix re-trigger same pane while pending — re-emit only");
-            self.messages.push(ChatMessage::Error(notification.summary.clone()));
-            self.scroll_to_bottom();
             self.emit_autofix_state_pending(&notification.pane_id, &notification.summary);
             return;
         }
@@ -1632,20 +1711,10 @@ impl App {
         // Store the failing pane ID so we can auto-fill `parent` on execution.
         self.autofix_pane_id = Some(notification.pane_id.clone());
 
-        // Push the error line (red dot) so the user sees it directly. We
-        // intentionally skip prepare_for_new_prompt: clearing history and
-        // setting current_prompt_text to "[auto-fix] ..." would produce a
-        // noisy "> [auto-fix] Pane N: command failed ..." turn header with
-        // no information. Leaving current_prompt_text=None means the
-        // response won't fold into a CompletedTurn — the error + the
-        // recommendation card render as flat, one-by-one messages.
-        self.messages
-            .push(ChatMessage::Error(notification.summary.clone()));
         self.prompt_in_flight = true;
         self.inflight_autofix_generation = Some(self.autofix_generation);
         self.progress_status = Some("Preparing context...".to_string());
         self.activity_frame = 0;
-        self.scroll_to_bottom();
 
         let prompt = PromptSubmission::new_autofix(prompt_text, Some(pane_context));
         self.current_prompt_id = Some(prompt.id);
@@ -1771,13 +1840,7 @@ impl App {
         self.activity_frame = 0;
     }
 
-    fn push_execution_info(&mut self, message: String) {
-        if let Some(turn) = self.completed_turns.last_mut() {
-            turn.details.push(ChatMessage::System(message));
-        } else {
-            self.messages.push(ChatMessage::System(message));
-        }
-    }
+    fn push_execution_info(&mut self, _message: String) {}
 
     fn current_turn_details(&self) -> Vec<ChatMessage> {
         self.messages
