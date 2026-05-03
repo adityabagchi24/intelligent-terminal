@@ -63,6 +63,9 @@ pub struct AgentProfile {
     pub auth_check_command: &'static str,
     /// Human-readable auth instructions shown when not logged in.
     pub auth_hint: &'static str,
+    /// Flag the CLI uses to resume a session, e.g. `"--resume"` for Claude.
+    /// Empty when resume is unsupported.
+    pub resume_flag: &'static str,
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -80,6 +83,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         install_url: "https://github.com/github/copilot-cli",
         auth_check_command: "",
         auth_hint: "Run 'copilot' to launch the CLI, then type /login to sign in.",
+        resume_flag: "--resume",
     },
     AgentProfile {
         id: "claude",
@@ -93,6 +97,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         install_url: "https://docs.anthropic.com/en/docs/claude-code",
         auth_check_command: "",
         auth_hint: "Run: claude login",
+        resume_flag: "--resume",
     },
     AgentProfile {
         id: "codex",
@@ -106,6 +111,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         install_url: "https://github.com/openai/codex",
         auth_check_command: "",
         auth_hint: "Run: codex auth",
+        resume_flag: "",
     },
     AgentProfile {
         id: "gemini",
@@ -119,6 +125,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         install_url: "https://github.com/google-gemini/gemini-cli",
         auth_check_command: "",
         auth_hint: "Authentication is handled in-protocol during connection.",
+        resume_flag: "--resume",
     },
 ];
 
@@ -134,6 +141,7 @@ pub const DEFAULT_PROFILE: AgentProfile = AgentProfile {
     install_url: "",
     auth_check_command: "",
     auth_hint: "",
+    resume_flag: "",
 };
 
 /// Default ACP command used when no agent is configured.

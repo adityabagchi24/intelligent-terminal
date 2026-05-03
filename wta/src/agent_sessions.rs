@@ -213,6 +213,15 @@ impl AgentSessionRegistry {
     pub fn has_session(&self, key: &AgentKey) -> bool {
         self.sessions.contains_key(key)
     }
+
+    pub fn remove(&mut self, key: &AgentKey) {
+        if let Some(s) = self.sessions.remove(key) {
+            if let Some(pane) = s.pane_session_id {
+                self.active_by_pane.remove(&pane);
+            }
+            self.dirty = true;
+        }
+    }
 }
 
 #[cfg(test)]

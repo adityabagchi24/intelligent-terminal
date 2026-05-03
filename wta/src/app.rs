@@ -424,6 +424,19 @@ struct TabSession {
 
 // --- App ---
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchedCommandKind {
+    FocusPane,
+    SplitPaneResume,
+}
+
+#[derive(Clone, Debug)]
+pub struct DispatchedCommand {
+    pub kind:       DispatchedCommandKind,
+    pub session_id: Option<String>,
+    pub argv:       Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Chat,
@@ -485,6 +498,8 @@ pub struct App {
     pub agent_sessions: crate::agent_sessions::AgentSessionRegistry,
     pub current_view: View,
     pub agents_list_state: ratatui::widgets::ListState,
+    #[cfg(test)]
+    pub last_dispatched_command: Option<DispatchedCommand>,
     current_prompt_text: Option<String>,
     pending_completed_turn: Option<CompletedTurn>,
     // WT event notifications
@@ -577,6 +592,8 @@ impl App {
                 s.select(Some(0));
                 s
             },
+            #[cfg(test)]
+            last_dispatched_command: None,
             current_prompt_text: None,
             pending_completed_turn: None,
             wt_notifications: VecDeque::new(),
@@ -1374,6 +1391,33 @@ impl App {
                 crossterm::event::KeyCode::Up => {
                     let cur = self.agents_list_state.selected().unwrap_or(0);
                     self.agents_list_state.select(Some(cur.saturating_sub(1)));
+                    return;
+                }
+                crossterm::event::KeyCode::Enter => {
+                    if let Some(idx) = self.agents_list_state.selected() {
+                        let selected = self.agent_sessions
+                            .iter_sorted()
+                            .get(idx)
+                            .map(|s| (*s).clone());
+                        if let Some(s) = selected {
+                            self.activate_session(&s);
+                        }
+                    }
+                    return;
+                }
+                crossterm::event::KeyCode::Delete => {
+                    if let Some(idx) = self.agents_list_state.selected() {
+                        let target = self.agent_sessions
+                            .iter_sorted()
+                            .get(idx)
+                            .map(|s| (s.key.clone(), s.status.clone()));
+                        if let Some((key, status)) = target {
+                            use crate::agent_sessions::AgentStatus::*;
+                            if matches!(status, Ended | Historical) {
+                                self.agent_sessions.remove(&key);
+                            }
+                        }
+                    }
                     return;
                 }
                 _ => {}
@@ -2887,6 +2931,75 @@ impl App {
         });
         send_wt_protocol_event(evt.to_string());
     }
+
+    fn activate_session(&mut self, s: &crate::agent_sessions::AgentSession) {
+        use crate::agent_sessions::AgentStatus::*;
+        match s.status {
+            Idle | Working | Attention | Error => {
+                if let Some(pane) = &s.pane_session_id {
+                    self.dispatch_focus_pane(pane.clone());
+                }
+            }
+            Ended | Historical => {
+                self.dispatch_resume(s);
+            }
+        }
+    }
+
+    fn dispatch_focus_pane(&mut self, pane_session_id: String) {
+        let argv = vec![
+            "focus-pane".to_string(),
+            "-t".to_string(),
+            pane_session_id.clone(),
+        ];
+        crate::shell::wt_channel::spawn_wtcli_async(&argv);
+        #[cfg(test)]
+        {
+            self.last_dispatched_command = Some(DispatchedCommand {
+                kind: DispatchedCommandKind::FocusPane,
+                session_id: Some(pane_session_id),
+                argv,
+            });
+        }
+    }
+
+    fn dispatch_resume(&mut self, s: &crate::agent_sessions::AgentSession) {
+        let cli_id = match s.cli_source {
+            crate::agent_sessions::CliSource::Claude  => "claude",
+            crate::agent_sessions::CliSource::Copilot => "copilot",
+            crate::agent_sessions::CliSource::Gemini  => "gemini",
+            crate::agent_sessions::CliSource::Unknown(_) => return,
+        };
+        let profile = crate::agent_registry::lookup_profile_by_id(cli_id);
+        if profile.resume_flag.is_empty() {
+            // v1: silently no-op for CLIs without resume support.
+            return;
+        }
+        let commandline = format!("{} {} {}", cli_id, profile.resume_flag, s.key);
+
+        // TODO(v2): wtcli's split-pane does not currently accept --starting-directory.
+        // The resumed pane inherits the splitting pane's cwd; the CLI's own --resume
+        // typically restores the session's original working directory anyway.
+        let argv = vec![
+            "split-pane".to_string(),
+            "-c".to_string(),
+            commandline,
+        ];
+        crate::shell::wt_channel::spawn_wtcli_async(&argv);
+        #[cfg(test)]
+        {
+            self.last_dispatched_command = Some(DispatchedCommand {
+                kind: DispatchedCommandKind::SplitPaneResume,
+                session_id: None,
+                argv,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub fn last_dispatched_command_for_test(&self) -> Option<DispatchedCommand> {
+        self.last_dispatched_command.clone()
+    }
 }
 
 /// Publish a raw JSON event via `wtcli publish`. The event flows through
@@ -3106,6 +3219,90 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.agents_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn enter_on_live_row_dispatches_focus_command() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "a".into(), cli_source: CliSource::Claude,
+            pane_session_id: "00000000-0000-0000-0000-0000000000aa".into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+        app.current_view = View::Agents;
+        app.agents_list_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let cmd = app.last_dispatched_command_for_test()
+            .expect("a command was dispatched");
+        assert_eq!(cmd.kind, DispatchedCommandKind::FocusPane);
+        assert_eq!(cmd.session_id.as_deref(), Some("00000000-0000-0000-0000-0000000000aa"));
+    }
+
+    #[test]
+    fn enter_on_history_row_dispatches_split_pane_with_resume() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "abc-123".into(), cli_source: CliSource::Claude,
+            pane_session_id: "p".into(), cwd: PathBuf::from("/work/proj"), title: "t".into(),
+        });
+        app.agent_sessions.apply(SessionEvent::SessionStopped {
+            key: "abc-123".into(), reason: "user_exit".into(),
+        });
+
+        app.current_view = View::Agents;
+        app.agents_list_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let cmd = app.last_dispatched_command_for_test()
+            .expect("a command was dispatched");
+        assert_eq!(cmd.kind, DispatchedCommandKind::SplitPaneResume);
+        let argv = cmd.argv.join(" ");
+        assert!(argv.contains("split-pane"), "argv: {}", argv);
+        assert!(argv.contains("claude --resume abc-123"), "argv: {}", argv);
+    }
+
+    #[test]
+    fn delete_on_history_row_removes_session_from_registry() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "k".into(), cli_source: CliSource::Claude,
+            pane_session_id: "p".into(), cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+        app.agent_sessions.apply(SessionEvent::SessionStopped {
+            key: "k".into(), reason: "".into(),
+        });
+        app.current_view = View::Agents;
+        app.agents_list_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(!app.agent_sessions.has_session(&"k".to_string()));
+    }
+
+    #[test]
+    fn delete_on_live_row_is_noop() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "k".into(), cli_source: CliSource::Claude,
+            pane_session_id: "p".into(), cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+        app.current_view = View::Agents;
+        app.agents_list_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(app.agent_sessions.has_session(&"k".to_string()));
     }
 
     // ─── word boundary helpers ──────────────────────────────────────────────

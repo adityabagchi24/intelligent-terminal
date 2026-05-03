@@ -1,6 +1,7 @@
 mod cli_channel;
 
 pub use cli_channel::CliChannel;
+pub use cli_channel::spawn_wtcli_async;
 
 // Re-export CliChannel as PipeChannel for backward compatibility.
 // All callers that used PipeChannel now get CliChannel (wraps wtcli.exe).

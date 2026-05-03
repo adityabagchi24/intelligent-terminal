@@ -56,6 +56,20 @@ fn resolve_wtcli_path() -> String {
     "wtcli".to_string()
 }
 
+/// Fire-and-forget invocation of wtcli for one-shot UI actions
+/// (focus-pane, split-pane). Errors are logged but not surfaced.
+pub fn spawn_wtcli_async(args: &[String]) {
+    let path = resolve_wtcli_path();
+    match std::process::Command::new(&path).args(args).spawn() {
+        Ok(_child) => {
+            tracing::debug!(target: "wtcli", path = %path, ?args, "spawned");
+        }
+        Err(err) => {
+            tracing::warn!(target: "wtcli", path = %path, ?args, %err, "spawn failed");
+        }
+    }
+}
+
 /// Channel that invokes `wtcli.exe` for protocol operations.
 /// Replaces the old PipeChannel (named-pipe transport).
 pub struct CliChannel {
