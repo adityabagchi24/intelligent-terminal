@@ -57,46 +57,215 @@ WindowsTerminal.exe                            (packaged)
     └── claude.exe / …
 ```
 
-### 2.4 Data-Flow Diagram (SendInput path — the critical path)
+### 2.4 DFDs — overview
+
+This document uses three levels of Data-Flow Diagram, conventional for Microsoft SDL threat modeling:
+
+| Level | Purpose |
+|---|---|
+| **Level 0** (§2.5) | Context diagram — system as a single process, all external actors and data stores |
+| **Level 1** (§2.6) | System DFD — every internal process, every cross-boundary data flow, all trust boundaries drawn |
+| **Level 2** (§2.7, §2.8) | Per-critical-area decomposition — SendInput path (post-fix) and settings.json mutation surface |
+
+DFD symbol convention: **circles** are processes (we use rounded boxes in Mermaid for compatibility), **rectangles** are external entities, **cylinders** are data stores, **dashed boxes** are trust boundaries, **arrows** are data flows (numbered `Fn`). The flow numbering established in §2.6 is reused throughout §3 (trust boundaries) and §6 (STRIDE tables).
+
+If your viewer does not render Mermaid, the diagrams below can be exported with `mmdc -i security-model.md -o ./images/`.
+
+### 2.5 Level 0 — Context diagram
 
 ```mermaid
 flowchart LR
-    User([User])
-    LLM[LLM Provider]
-    AgentCLI[Agent CLI]
-    WTA[wta.exe]
-    PipeSrv[PipeServer<br/>in WT]
-    TermPage[TerminalPage<br/>in WT]
-    Shell[Shell stdin<br/>via ConPTY]
+    User[/"User<br/>(external)"/]
+    LLM[/"LLM Provider<br/>(external)"/]
+    Vendor[/"Agent CLI Vendor<br/>(external, supply chain)"/]
+    AT(("Agentic Terminal<br/>(WT + wta + Agent CLI<br/>+ wtcli + shells)"))
+    FS[("Local filesystem<br/>settings.json, logs")]
+    AgentBin[("Agent CLI binary<br/>(installed on disk)")]
 
-    User -- types prompt --> WTA
-    WTA -- ACP request --> AgentCLI
-    AgentCLI <-. HTTPS .-> LLM
-    AgentCLI -- ACP response<br/>"send 'dir' to pane 1" --> WTA
-    WTA -- "JSON-RPC<br/>send_input" --> PipeSrv
-    PipeSrv -- SendProtocolInput --> TermPage
-    TermPage -- WriteInput --> Shell
+    User -- "F0.1 prompts, keystrokes,<br/>command-palette ?" --> AT
+    AT -- "F0.2 rendered VT output" --> User
+    AT == "F0.3 HTTPS<br/>(prompt + scrollback ctx)" ==> LLM
+    LLM == "F0.4 HTTPS response" ==> AT
+    Vendor -. "F0.5 out-of-band install<br/>(MSI / package manager)" .-> AgentBin
+    AgentBin -- "F0.6 spawned by AT" --> AT
+    AT <-. "F0.7 read/write" .-> FS
 
-    classDef boundary stroke-dasharray:5 5,fill:#fffaf0
-    class WTA,PipeSrv boundary
+    classDef ext fill:#f0e0e0,stroke:#a04040,color:#000
+    classDef sys fill:#e0e8f0,stroke:#204060,stroke-width:3px,color:#000
+    classDef ds fill:#fffaf0,stroke:#806040,color:#000
+    class User,LLM,Vendor ext
+    class AT sys
+    class FS,AgentBin ds
 ```
 
-The trust boundary that matters most for this doc: **the dashed boundary between AgentCLI and WTA**, and between **WTA and PipeServer** — those are where untrusted LLM-shaped intent crosses into "executes commands on the user's shell".
+**Reading the L0:** the system has three external trust counterparties — the User (trusted), the LLM Provider (semi-trusted, sees prompts), and the Agent CLI Vendor (semi-trusted, supplies the binary that interprets LLM output). The double-line arrows (F0.3, F0.4) cross the most security-relevant external boundary: HTTPS to a third-party LLM, where prompt content (which can contain pane scrollback) leaves the host.
+
+### 2.6 Level 1 — System DFD
+
+```mermaid
+flowchart TB
+    User[/User/]
+    LLM[/LLM Provider/]
+
+    subgraph TB_pkg ["WT package identity"]
+        WT(("1.0 WT<br/>WindowsTerminal.exe<br/>(incl. PipeServer §6.2,<br/>ComServer §6.1)"))
+        WTA_AP(("2.0 wta agent-pane"))
+        WTA_DG(("3.0 wta delegation<br/>(hidden)"))
+        WTCLI(("5.0 wtcli.exe"))
+    end
+
+    subgraph TB_agent ["Semi-trusted"]
+        ACLI(("4.0 Agent CLI<br/>claude/copilot/gemini"))
+    end
+
+    subgraph TB_pane ["Untrusted user pane"]
+        Shell(("6.0 Pane shell"))
+        InPane(("6.1 in-pane process<br/>(npm/pip/exe)"))
+    end
+
+    Settings[("DS1<br/>settings.json")]
+    Logs[("DS2<br/>wta-*.log")]
+    Scroll[("DS3<br/>pane scrollback<br/>(in WT memory)")]
+
+    User -- "F1 prompts/keys" --> WT
+    WT -- "F2 VT output" --> User
+
+    WT == "F3 secure pipe<br/>JSON-RPC send_input<br/>(TB2 / TB3)" ==> WTA_AP
+    WTA_AP == "F3" ==> WT
+    WT == "F4 secure pipe<br/>(TB3)" ==> WTA_DG
+    WTA_DG == "F4" ==> WT
+
+    WTCLI -- "F5 COM IProtocolServer<br/>(reads + non-SendInput<br/>mutations) — TB6" --> WT
+    InPane -. "F6 attacker invokes wtcli<br/>(WT_COM_CLSID inherited)" .-> WTCLI
+
+    WTA_AP <-- "F7 ACP stdio<br/>(TB4)" --> ACLI
+    WTA_DG <-- "F8 ACP stdio" --> ACLI
+    ACLI <== "F9 HTTPS<br/>(TB5)" ==> LLM
+
+    WT -- "F10 ConPTY stdin" --> Shell
+    Shell -- "F11 stdout/VT<br/>(incl. OSC 133 marks)" --> WT
+    Shell -. "F12 child spawn" .-> InPane
+
+    WT <-. "F13 read/write<br/>(TB7)" .-> Settings
+    WT <-. "F14 read scrollback<br/>(via ReadPaneOutput)" .-> Scroll
+    Shell -. "F15 captured into" .-> Scroll
+    WTA_AP -. "F16 append<br/>(TB7)" .-> Logs
+    WTA_DG -. "F16" .-> Logs
+
+    classDef ext fill:#f0e0e0,stroke:#a04040,color:#000
+    classDef ds fill:#fffaf0,stroke:#806040,color:#000
+    class User,LLM ext
+    class Settings,Logs,Scroll ds
+
+    style TB_pkg stroke-dasharray:5 5,fill:#e8f0f8
+    style TB_agent stroke-dasharray:5 5,fill:#fff0e0
+    style TB_pane stroke-dasharray:5 5,fill:#ffe0e0
+```
+
+**Reading the L1.** Three trust zones, color-coded:
+
+- **Blue (WT package identity):** the four packaged processes that share a code-signed identity. The pipe transport (F3, F4) crosses **inside** this zone via kernel handle inheritance — capability cannot be regranted, see §7.1.
+- **Tan (semi-trusted):** the Agent CLI runs as wta's child but is third-party code. ACP (F7, F8) crosses TB4. Network egress (F9) crosses TB5.
+- **Red (untrusted user pane):** the user's shell and any process it spawns. F6 is the attack we eliminated for `SendInput`: in-pane process inherits `WT_COM_CLSID`, spawns wtcli, calls into WT. Post-fix wtcli still has F5 (read methods + non-SendInput mutations); SendInput specifically does not flow over F5 anymore.
+
+**Key observation visible in the diagram:** the data flow `(F11 stdout) → (F15 captured into scrollback) → (F14 read by WT) → (delivered as prompt context to F3) → (forwarded over F9 to LLM)` is the **prompt-injection channel**. Anything an in-pane process echoes can become an instruction that the LLM follows and that comes back as a `send_input` request over F3. This is R2 in §10.
+
+### 2.7 Level 2 — SendInput data path (post-fix)
+
+Refines F3/F4 from the L1, showing the in-process detail of how `send_input` traverses WT.
+
+```mermaid
+flowchart LR
+    Attacker[/"untrusted content<br/>(in scrollback / web / file<br/>read by Agent CLI)"/]
+    LLM[/LLM Provider/]
+    ACLI(("Agent CLI"))
+    WTA(("wta<br/>RoutedChannel"))
+    PipeSrv(("WT::PipeServer<br/>(IO thread)"))
+    TermPage(("WT::TerminalPage<br/>::SendProtocolInput"))
+    TermCtl(("WT::TermControl<br/>::SendInput"))
+    Core(("WT::ControlCore<br/>::SendInput"))
+    Shell[("DS:<br/>shell stdin<br/>via ConPTY")]
+
+    Attacker -. "L2.1 reaches LLM as<br/>injected instruction" .-> LLM
+    LLM == "L2.2 (F0.4) ACP-shaped<br/>response: 'send dir to pane 1'" ==> ACLI
+    ACLI -- "L2.3 (F7) ACP req<br/>{action:'send', parent:1, input:'dir'}" --> WTA
+    WTA == "L2.4 (F3) JSON-RPC frame<br/>method=send_input<br/>over inherited pipe" ==> PipeSrv
+    PipeSrv -- "L2.5 dispatch<br/>(UI dispatcher)" --> TermPage
+    TermPage -- "L2.6 find pane by<br/>ContentId tree-walk" --> TermCtl
+    TermCtl -- "L2.7 RawWriteString" --> Core
+    Core -- "L2.8 _connection.WriteInput<br/>(read-only check)" --> Shell
+
+    classDef ext fill:#f0e0e0,stroke:#a04040,color:#000
+    classDef ds fill:#fffaf0,stroke:#806040,color:#000
+    classDef pipe stroke-dasharray:5 5,stroke-width:3px,fill:#fff8e0,color:#000
+    class Attacker,LLM ext
+    class Shell ds
+    class WTA,PipeSrv pipe
+
+    linkStyle 3 stroke:#c00000,stroke-width:3px
+```
+
+**Where the security guarantees apply:**
+
+| Step | Guarantee | Source |
+|---|---|---|
+| L2.4 (the bold red flow) | Capability-bound: only a process that **inherited** the pipe handles can send this frame. Attacker with `WT_COM_CLSID` cannot craft this. | §7.1, M-1, M-4 |
+| L2.5 | Method allow-list enforced — `_methods` map only registers `hello` and `send_input` today. | §6.2 P-6 |
+| L2.6 | `paneId` validated against `ContentId` tree-walk; non-existent or wrong-process panes fail closed. | §6.2 P-8 |
+| L2.8 | `ControlCore::SendInput` honours read-only mode flag; pane-level lockout still applies. | §6.2 P-8 |
+
+**Where the security guarantees do NOT apply** (residual): L2.1 — L2.4 itself. If the LLM is prompt-injected and the user has `aiIntegration.confirmation.inputOperations = auto`, the injected `send_input` reaches L2.5 with full authorisation. This is R2 in §10; mitigations are M-11/M-12/M-13.
+
+### 2.8 Level 2 — settings.json mutation path (current threat — R3)
+
+Refines F5/F13 from the L1, showing the persistent-EoP loop that is the highest-severity unmitigated risk.
+
+```mermaid
+flowchart LR
+    InPane(("in-pane process<br/>(TA1)"))
+    DriveBy[/"drive-by writer<br/>(TA5)"/]
+    WTCLI(("wtcli"))
+    ComSrv(("WT::ComServer<br/>::SetSettings"))
+    Settings[("DS1 settings.json<br/>(config)")]
+    AgentNext(("future agent session<br/>(reads config at startup<br/>or via live-reload)"))
+    AnyPane(("user shell<br/>(future session)"))
+
+    InPane == "S2.1 spawn wtcli<br/>(WT_COM_CLSID inherited<br/>via F6)" ==> WTCLI
+    WTCLI == "S2.2 COM SetSettings<br/>(F5)" ==> ComSrv
+    ComSrv == "S2.3 write file" ==> Settings
+    DriveBy -. "S2.4 direct file write<br/>(browser/IDE/script,<br/>out-of-band)" .-> Settings
+
+    Settings == "S2.5 next AT process<br/>reads config" ==> AgentNext
+    AgentNext == "S2.6 confirmation.* now 'auto';<br/>delegateAgent now attacker-binary" ==> AnyPane
+
+    classDef ext fill:#f0e0e0,stroke:#a04040,color:#000
+    classDef ds fill:#fffaf0,stroke:#806040,color:#000
+    classDef att fill:#ffe0e0,stroke:#a02020,stroke-width:2px,color:#000
+    class DriveBy ext
+    class Settings ds
+    class InPane,AnyPane att
+
+    linkStyle 0,1,2,4,5 stroke:#c00000,stroke-width:2px
+```
+
+**Why this is R3 / single-highest residual risk:** the chain S2.1 → S2.6 is **not gated by user confirmation today**. Any in-pane attacker (TA1) who runs once for a few seconds gets persistent agent behaviour change. M-2 (move `SetSettings` off COM onto the per-wta pipe) is the canonical mitigation. M-7 (require confirmation for confirmation-policy edits — meta-confirmation) is a secondary backstop that helps even before M-2 lands.
 
 ---
 
 ## 3. Trust Boundaries
 
-| ID | Boundary | Direction(s) | Enforcement |
+Boundaries are referenced from §2.6 (Level 1 DFD) and §6 (STRIDE tables).
+
+| ID | Boundary | L1 flows that cross it | Enforcement |
 |---|---|---|---|
-| **TB1** | WT ↔ in-pane shell | bidirectional (PTY) | ConPTY isolation; parent-child relationship; package identity inherited |
-| **TB2** | WT ↔ WTA (agent-pane) | bidirectional via C-PIPE | **Kernel handle inheritance via STARTUPINFOEX HANDLE_LIST**; wt-side handles non-inheritable; wta strips `HANDLE_FLAG_INHERIT` at startup |
-| **TB3** | WT ↔ WTA (delegation, hidden) | same as TB2 | Same as TB2 |
-| **TB4** | WTA ↔ Agent CLI | bidirectional via C-ACP (stdio) | Parent-child stdin/stdout; no auth (we own the spawn) |
-| **TB5** | Agent CLI ↔ LLM | bidirectional via C-NET | TLS, provider's API key auth — not our concern, but user data leaves the host here |
-| **TB6** | WT ↔ wtcli (and **any** caller of wtcli) | wtcli → WT only | `WT_COM_CLSID` env var possession + COM package identity. **This is ambient — every child of every pane sees it.** |
-| **TB7** | All ↔ filesystem (settings.json, logs) | bidirectional | NTFS ACLs (packaged sandbox redirects) |
-| **TB8** | wta ↔ wta's grandchildren | wta → child (Agent CLI) | wta's spawn flags (no `HANDLE_FLAG_INHERIT` on pipe handles after `from_env`) |
+| **TB1** | WT ↔ in-pane shell | F10, F11, F15 | ConPTY isolation; parent-child relationship; package identity inherited |
+| **TB2** | WT ↔ WTA (agent-pane) | F3 | **Kernel handle inheritance via STARTUPINFOEX HANDLE_LIST**; wt-side handles non-inheritable; wta strips `HANDLE_FLAG_INHERIT` at startup |
+| **TB3** | WT ↔ WTA (delegation, hidden) | F4 | Same as TB2 |
+| **TB4** | WTA ↔ Agent CLI | F7, F8 | Parent-child stdin/stdout; no auth (we own the spawn) |
+| **TB5** | Agent CLI ↔ LLM | F9 | TLS, provider's API key auth — not our concern, but user data leaves the host here |
+| **TB6** | WT ↔ wtcli (and **any** caller of wtcli) | F5, F6 | `WT_COM_CLSID` env var possession + COM package identity. **This is ambient — every child of every pane sees it.** |
+| **TB7** | All ↔ filesystem (settings.json, logs, scrollback DS) | F13, F14, F16 | NTFS ACLs (packaged sandbox redirects) |
+| **TB8** | wta ↔ wta's grandchildren | (intra-process: between `WT_PROTOCOL_PIPE_R/W` env-read and child spawn in wta) | wta's spawn flags (no `HANDLE_FLAG_INHERIT` on pipe handles after `from_env`) |
 
 **Critical observation (TB6):** `WT_COM_CLSID` is propagated by `ConptyConnection::_LaunchAttachedClient` into **every shell process WT spawns**, and from there into every child of those shells. Any malicious npm/pip/exe in the user's pane can call `IProtocolServer` methods through wtcli or directly via `CoCreateInstance`. **This is the dominant ambient surface and the reason SendInput had to be moved off it.**
 
