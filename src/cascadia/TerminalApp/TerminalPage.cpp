@@ -868,12 +868,13 @@ namespace winrt::TerminalApp::implementation
         // Persist: never show FRE again
         ApplicationState::SharedInstance().AgentFreCompleted(true);
 
-        // Now that FRE is done, kick off agent pane pre-warming.
-        if (!_agentPane.lock())
+        // Agent pane was already created during startup with --setup.
+        // Focus it so the user can interact with the Getting Started screen.
+        if (const auto agentPane = _FindAgentPane())
         {
-            if (const auto tab = _GetFocusedTabImpl())
+            if (const auto& content = agentPane->GetContent())
             {
-                _AutoCreateHiddenAgentPane(tab);
+                content.Focus(winrt::Windows::UI::Xaml::FocusState::Programmatic);
             }
         }
     }
@@ -1156,14 +1157,7 @@ namespace winrt::TerminalApp::implementation
     // and autofix work in the background as long as the pane hasn't been closed.
     void TerminalPage::_AutoCreateHiddenAgentPane(winrt::com_ptr<Tab> tab)
     {
-        // FRE not completed — don't pre-warm the agent pane.
-        // The user hasn't seen the welcome screen yet; we'll create
-        // the pane after they dismiss the FRE overlay.
-        if (_IsFreRequired())
-        {
-            _agentPaneLog("_AutoCreateHiddenAgentPane: FRE not completed, skipping");
-            return;
-        }
+        const bool isFirstRun = _IsFreRequired();
 
         // Already have a live pane — nothing to do.
         if (_agentPane.lock())
@@ -1230,6 +1224,11 @@ namespace winrt::TerminalApp::implementation
         if (!globals.AutoFixEnabled())
         {
             cmdline += L" --no-autofix";
+        }
+
+        if (isFirstRun)
+        {
+            cmdline += L" --setup first-run";
         }
 
         _agentPaneLog("_AutoCreateHiddenAgentPane: cmdline=" + winrt::to_string(winrt::hstring{ cmdline }));
@@ -1340,21 +1339,27 @@ namespace winrt::TerminalApp::implementation
                 weakRootPane,
                 weakSelfForHide,
                 termControlWeak = winrt::make_weak(termControl),
-                tokenHolder
+                tokenHolder,
+                isFirstRun
             ](auto&& /*sender*/, auto&& /*args*/) {
-                _agentPaneLog("_AutoCreateHiddenAgentPane: TermControl Initialized — hiding pane now");
+                _agentPaneLog("_AutoCreateHiddenAgentPane: TermControl Initialized");
                 if (const auto tc = termControlWeak.get())
                 {
                     tc.Initialized(*tokenHolder);
                 }
-                if (auto self = weakSelfForHide.get())
+                // During first-run, keep the pane visible so the user sees
+                // the Getting Started screen behind the FRE dialog overlay.
+                if (!isFirstRun)
                 {
-                    if (auto rootPane = weakRootPane.lock())
+                    if (auto self = weakSelfForHide.get())
                     {
-                        if (auto pane = weakNewPane.lock())
+                        if (auto rootPane = weakRootPane.lock())
                         {
-                            rootPane->HidePane(pane);
-                            self->_UpdateBottomBarState();
+                            if (auto pane = weakNewPane.lock())
+                            {
+                                rootPane->HidePane(pane);
+                                self->_UpdateBottomBarState();
+                            }
                         }
                     }
                 }
@@ -1362,13 +1367,16 @@ namespace winrt::TerminalApp::implementation
         }
         else
         {
-            // No TermControl on the new pane (shouldn't happen for a
-            // terminal-content pane). Fall back to the old immediate-hide
-            // behavior to avoid leaving a visible auto-created pane.
-            _agentPaneLog("_AutoCreateHiddenAgentPane: no TermControl on new pane, hiding immediately");
-            if (const auto rootPane = tab->GetRootPane())
+            if (!isFirstRun)
             {
-                rootPane->HidePane(newPane);
+                // No TermControl on the new pane (shouldn't happen for a
+                // terminal-content pane). Fall back to the old immediate-hide
+                // behavior to avoid leaving a visible auto-created pane.
+                _agentPaneLog("_AutoCreateHiddenAgentPane: no TermControl on new pane, hiding immediately");
+                if (const auto rootPane = tab->GetRootPane())
+                {
+                    rootPane->HidePane(newPane);
+                }
             }
         }
 

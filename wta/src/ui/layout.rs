@@ -1,10 +1,41 @@
 use ratatui::prelude::*;
-use crate::app::App;
+use crate::app::{App, AppMode};
 
-use super::{chat, debug_panel, input, permission, recommendations};
+use super::{auth, chat, debug_panel, input, permission, recommendations, setup};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+
+    // Auth mode: show auth screen above the input box
+    if app.mode == AppMode::Auth {
+        let input_height = input::input_height(&app.input, app.cursor_pos, area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(input_height),
+            ])
+            .split(area);
+        auth::render(frame, app, chunks[0]);
+        input::render(frame, app, chunks[1]);
+        return;
+    }
+
+    // Setup mode: show setup screen above the input box
+    if app.mode == AppMode::Setup {
+        // Split: setup area | input
+        let input_height = input::input_height(&app.input, app.cursor_pos, area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(input_height),
+            ])
+            .split(area);
+        setup::render(frame, app, chunks[0]);
+        input::render(frame, app, chunks[1]);
+        return;
+    }
 
     let (main_area, debug_area) = if app.show_debug_panel {
         let h = Layout::default()

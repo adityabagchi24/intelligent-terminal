@@ -281,7 +281,7 @@ impl SharedUiEvent {
             | AppEvent::SharedStateSnapshot(_)
             | AppEvent::SharedPermissionRequest { .. }
             | AppEvent::PermissionCleared => None,
-            AppEvent::UserMessage(_) | AppEvent::MouseScroll { .. } => None,
+            AppEvent::UserMessage(_) | AppEvent::MouseScroll { .. } | AppEvent::AgentInstallComplete(_) | AppEvent::AuthCheckComplete(_) | AppEvent::LoginProgress { .. } | AppEvent::LoginComplete { .. } => None,
         }
     }
 
@@ -1975,7 +1975,11 @@ impl HostSessionState {
             | AppEvent::MouseScroll { .. }
             | AppEvent::Resize(_, _)
             | AppEvent::DebugPipeMessage(_)
-            | AppEvent::SharedStateSnapshot(_) => {}
+            | AppEvent::SharedStateSnapshot(_)
+            | AppEvent::AgentInstallComplete(_)
+            | AppEvent::AuthCheckComplete(_)
+            | AppEvent::LoginProgress { .. }
+            | AppEvent::LoginComplete { .. } => {}
         }
     }
 
