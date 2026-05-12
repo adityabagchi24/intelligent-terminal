@@ -375,6 +375,7 @@ Delegation is an agent-launch and context-transfer path, not a direct shell-inpu
 | Diagnostic logs may disclose sensitive data | Information disclosure | Medium | WTA and hook logs may contain prompts, tool metadata, event payload summaries, command lines, errors, and model / agent output snippets depending on operation and log level. Known examples include `wta-main.log`, `wta-delegate.log`, `wta-agent-pane.log`, `wta-install-hooks.log`, and `hook-trace.log`. No systematic redaction or rotation is documented in the current implementation. |
 | Direct `settings.json` file write | Tampering | Critical for persistent AI-policy bypass; not OS privilege escalation | Inherits filesystem ACL behavior; no meta-confirmation for policy changes before WT honors the changed settings in future WTA / agent launches. |
 | Crafted OSC marks for Autofix | Information disclosure / Prompt injection / Tampering | High | OSC 133 is shell-controlled. With `autoFixEnabled=true` by default, a crafted failure mark can trigger WTA's Autofix analysis path to submit an agent prompt and read source-pane context via `wt_read_last_prompt` / `wt_read_pane_output` before any fix-execution confirmation. User interaction still gates applying a suggested fix, but pane-context disclosure and prompt-injection exposure can happen during analysis. |
+| Delegation context disclosure | Information disclosure / Prompt injection | High | `wta delegate` / `?<prompt>` reads the active pane's recent output (`ReadPaneOutput(..., 30)`) and appends it as terminal context to the delegate prompt. The delegate agent is then launched with that prompt context, so sensitive pane data can be disclosed to the Agent CLI / LLM and exposed through command-line or diagnostic surfaces without a separate context confirmation. |
 
 ### Scope boundary note
 
@@ -420,6 +421,7 @@ When `bInheritHandles=TRUE` is used with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, in
 | Pin or verify built-in Agent CLI binary identity and ACP adapter provenance | Partial — known-location / PATH resolution only; no signature pinning; `npx` adapter package versions / sources are not pinned or vendored | Agent CLI and adapter supply chain |
 | Pin or verify WTA binary identity and remove PATH fallback from production launches | Planned | WTA binary substitution |
 | Autofix opt-in / first-run hardening | Not implemented; `autoFixEnabled` defaults to `true` | Automatic pane-context disclosure, surprise background analysis, and prompt-injection exposure |
+| Delegation context confirmation and prompt transport hardening | Not implemented; delegate prompt is enriched with recent active-pane output and launched through startup command line | Pane-context disclosure to delegate Agent CLI / LLM and command-line/log surfaces |
 
 ---
 
@@ -430,13 +432,14 @@ When `bInheritHandles=TRUE` is used with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, in
 3. **Prompt injection.** The pipe proves the caller has WTA's capability; it does not prove the LLM request is safe.
 4. **Filesystem settings persistence.** Any user-context process can overwrite `settings.json` and persistently change agent selection, Autofix behavior, or future confirmation settings for future WT launch paths.
 5. **Autofix-triggered context disclosure.** Crafted shell-controlled OSC failure marks can cause WTA to read source-pane context and send it to the Agent CLI / LLM during analysis, before any suggested fix is applied.
-6. **Scrollback exfiltration.** `ReadPaneOutput` can pass sensitive pane text to WTA and then to the Agent CLI / LLM provider.
-7. **Log disclosure.** Diagnostic logs may contain prompts, event payloads, model / agent output snippets, and command lines.
-8. **Hook bridge event spoofing.** Until `agent_event` is source-bound or scoped, a COM-allowed caller can spoof agent lifecycle/tool events and mislead WTA session state.
-9. **Hook bridge persistent config / path trust.** Installed Agent CLI hooks persist outside WT, and bundle / `wtcli` path overrides must be trusted whenever hook installation or execution occurs.
-10. **Agent CLI / ACP adapter supply chain.** Local agent binaries and package-manager-launched ACP adapters run in the semi-trusted Agent CLI position; `npx -y` adapter launch should not be treated as equivalent to a pinned local binary.
-11. **WTA binary substitution.** Any non-packaged fallback path that resolves an attacker-controlled `wta.exe` grants that binary the inherited pipe capability.
-12. **Platform-dependent COM security.** Cross-integrity COM behavior should be regression-tested with the real `IProtocolServer` IID or a harmless method such as `GetCapabilities`; `IUnknown`-only activation is not sufficient evidence.
+6. **Delegation context disclosure.** `wta delegate` / `?<prompt>` can read recent active-pane output and pass it to a delegate Agent CLI / LLM as startup prompt context.
+7. **Scrollback exfiltration.** `ReadPaneOutput` can pass sensitive pane text to WTA and then to the Agent CLI / LLM provider.
+8. **Log disclosure.** Diagnostic logs may contain prompts, event payloads, model / agent output snippets, and command lines.
+9. **Hook bridge event spoofing.** Until `agent_event` is source-bound or scoped, a COM-allowed caller can spoof agent lifecycle/tool events and mislead WTA session state.
+10. **Hook bridge persistent config / path trust.** Installed Agent CLI hooks persist outside WT, and bundle / `wtcli` path overrides must be trusted whenever hook installation or execution occurs.
+11. **Agent CLI / ACP adapter supply chain.** Local agent binaries and package-manager-launched ACP adapters run in the semi-trusted Agent CLI position; `npx -y` adapter launch should not be treated as equivalent to a pinned local binary.
+12. **WTA binary substitution.** Any non-packaged fallback path that resolves an attacker-controlled `wta.exe` grants that binary the inherited pipe capability.
+13. **Platform-dependent COM security.** Cross-integrity COM behavior should be regression-tested with the real `IProtocolServer` IID or a harmless method such as `GetCapabilities`; `IUnknown`-only activation is not sufficient evidence.
 
 > Regression-test scope (not present-state residual risk): current WTA handle hygiene is strong, but future spawn-site changes can reintroduce leaks if they enable broad handle inheritance. Add a regression test that asserts `WT_PROTOCOL_PIPE_R/W` are unset in the Agent CLI environment and that the `HANDLE_FLAG_INHERIT` bit is cleared on WTA's copies before any grandchild spawn.
 
@@ -459,6 +462,7 @@ When `bInheritHandles=TRUE` is used with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, in
 | **P1** | Add source-pane / target-pane authorization for pipe `send_input`, or explicitly document that WTA may target any pane by session GUID. |
 | **P1** | Scope or authorize lower-impact COM mutations (`ClosePane`, `FocusPane`, `SetSessionVariable`) separately from process creation. |
 | **P1** | Autofix opt-in / first-run hardening — change `autoFixEnabled` default to `false` (or surface an analysis-time prompt) so pane context is not sent to the Agent CLI / LLM by surprise. |
+| **P1** | Add delegation context confirmation/redaction and avoid putting full pane context into delegate command lines or diagnostic logs. |
 | **P2** | Migrate read methods (`ReadPaneOutput`, `GetSettings`, topology reads) after mutation methods. |
 | **P2** | Tighten built-in Agent CLI resolution and binary identity checks, and pin/vendor/verify ACP adapter packages launched through package managers such as `npx -y`. |
 | **P2** | Tighten hook bundle and hook-side `wtcli.exe` resolution: packaged bundle by default, explicit consent for `WTA_HOOKS_BUNDLE_DIR` / dev-tree / `WTCLI_PATH` overrides. |
@@ -489,6 +493,7 @@ When `bInheritHandles=TRUE` is used with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, in
 - `wta/src/shell/wt_channel/pipe_channel.rs` - WTA inherited-pipe client
 - `wta/src/shell/wt_channel/routed_channel.rs` - pipe-vs-COM method routing
 - `wta/src/shell/wt_channel/cli_channel.rs` - `wtcli` fallback transport
+- `wta/src/main.rs`, `wta/src/coordinator.rs` - delegation context collection and delegate command-line construction
 - `wta/src/agent_registry.rs`, `wta/src/protocol/acp/client.rs` - Agent CLI / ACP adapter command construction and launch
 - `wta/src/agent_hooks_installer.rs` - `wt-agent-hooks` install / status / uninstall logic
 - `wta/wt-agent-hooks/` - Agent CLI hook bridge bundle and `send-event.ps1`
