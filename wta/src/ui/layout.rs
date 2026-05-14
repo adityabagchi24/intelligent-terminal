@@ -77,11 +77,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // The host (Windows Terminal) renders the agent bar in XAML above this
     // pane, so wta uses the full pane area for chat / recommendations / input.
+    //
+    // Layout: chat sized to its content, rec panel right below, blank
+    // filler, input at the bottom. Without this, a short chat would let the
+    // `Min(1)` chat constraint absorb all spare space and push the rec
+    // panel to the bottom of the pane, leaving a large empty band between
+    // the prompt and the cards.
+    let chat_content_width = main_area.width.saturating_sub(2); // h_chat 1+1 padding
+    let chat_height = chat::estimated_block_height(app, chat_content_width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
+            Constraint::Length(chat_height),
             rec_height,
+            Constraint::Min(0),
             Constraint::Length(input_height),
         ])
         .split(main_area);
@@ -99,7 +108,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     chat::render(frame, app, h_chat[1]);
     app.sync_rec_scroll_max();
     recommendations::render(frame, app, h_rec[1]);
-    input::render(frame, app, chunks[2]);
+    input::render(frame, app, chunks[3]);
 
     if let Some(debug_area) = debug_area {
         debug_panel::render(frame, app, debug_area);
@@ -157,14 +166,17 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
         input::input_height(&tab.input, tab.cursor_pos, main_area.width)
     };
 
+    let chat_content_width = main_area.width.saturating_sub(2);
+    let chat_height = chat::estimated_block_height(app, chat_content_width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
+            Constraint::Length(chat_height),
             rec_height,
+            Constraint::Min(0),
             Constraint::Length(input_height),
         ])
         .split(main_area);
 
-    input::cursor_position(app, chunks[2])
+    input::cursor_position(app, chunks[3])
 }

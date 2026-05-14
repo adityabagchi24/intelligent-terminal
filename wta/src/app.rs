@@ -3901,19 +3901,21 @@ impl App {
         total.min(ceiling).max(floor)
     }
 
-    /// Recompute `rec_scroll.max` from the current card heights. Called from
-    /// layout.rs before `recommendations::render` so the renderer stays
-    /// `&App` and any wheel-driven over-scroll is clamped before paint.
+    /// Recompute `rec_scroll.max` from the current card heights and the
+    /// panel's available cards region. Called from layout.rs before
+    /// `recommendations::render` so the renderer stays `&App` and any
+    /// wheel-driven over-scroll is clamped before paint.
     ///
-    /// The bound is `total - last_card_h`: any larger offset would shift the
-    /// last card's top above `rec_scroll`, and our shifted-scroll model
-    /// skips partial cards — so we'd render nothing.
+    /// `max = total_cards_h - panel_cards_h` (saturating): when the panel
+    /// grows large enough to fit every card, `max` drops to 0 and `set_max`
+    /// snaps `offset` back to the top — so resizing the pane wider
+    /// "rearranges" the panel without needing a manual scroll.
     pub fn sync_rec_scroll_max(&mut self) {
         let w = self.terminal_cols;
+        let panel_cards_h = (self.rec_panel_height() as usize).saturating_sub(1);
         let Some(recs) = self.current_tab().recommendations.as_ref() else { return };
         let total: usize = recs.choices.iter().map(|c| rec_card_height(c, w)).sum();
-        let last: usize = recs.choices.last().map(|c| rec_card_height(c, w)).unwrap_or(0);
-        self.current_tab_mut().rec_scroll.set_max(total.saturating_sub(last));
+        self.current_tab_mut().rec_scroll.set_max(total.saturating_sub(panel_cards_h));
     }
 
     fn clear_recommendations(&mut self) {

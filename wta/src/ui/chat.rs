@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{App, ChatMessage, PlanEntryStatus};
+use crate::app::{App, ChatMessage, CompletedTurn, PlanEntryStatus};
 use crate::theme;
 use crate::ui_trace;
 
@@ -31,6 +31,70 @@ const SHIMMER_BRIGHT_RGB: (u8, u8, u8) = (217, 217, 217);
 
 const ACTIVITY_PREVIEW_MAX_CHARS: usize = 180;
 const MAX_RENDER_LINE_CHARS: usize = 4096;
+
+/// Estimate the chat block's natural height (in visual rows) given the
+/// rendering width. Counts wraps for each message + completed turn plus the
+/// pinned activity row when active. Used by `layout::render` to size the
+/// chat area so the rec panel sits directly below content instead of being
+/// pushed to the pane bottom by a `Min(1)` spacer.
+pub fn estimated_block_height(app: &App, area_width: u16) -> u16 {
+    let tab = app.current_tab();
+    let wrap_width = (area_width as usize).max(1);
+
+    let activity = if tab.prompt_in_flight
+        || tab.agent_streaming
+        || tab.progress_status.is_some()
+    {
+        1usize
+    } else {
+        0
+    };
+
+    let messages: usize = tab.messages.iter().map(|m| message_height(m, wrap_width)).sum();
+    let turns: usize = tab.completed_turns.iter().map(|t| turn_height(t, wrap_width)).sum();
+
+    (activity + messages + turns).max(1).min(u16::MAX as usize) as u16
+}
+
+fn wrap_count(text: &str, width: usize) -> usize {
+    let w = width.max(1);
+    text.split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 { 1 } else { chars.div_ceil(w) }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn message_height(msg: &ChatMessage, wrap_width: usize) -> usize {
+    // Most variants render with a 2-cell prefix ("● " for agent/error,
+    // "> " for user) and a trailing blank line.
+    let body_width = wrap_width.saturating_sub(2).max(1);
+    match msg {
+        ChatMessage::User(t) | ChatMessage::Agent(t) | ChatMessage::Error(t) => {
+            wrap_count(t, body_width) + 1
+        }
+        ChatMessage::System(t) | ChatMessage::AgentEvent(t) => wrap_count(t, wrap_width) + 1,
+        ChatMessage::ToolCall { .. } => 1,
+        ChatMessage::Plan(entries) => 2 + entries.len(), // header + each entry + blank
+    }
+}
+
+fn turn_height(turn: &CompletedTurn, wrap_width: usize) -> usize {
+    // Collapsed view = single Line "▶ > <prompt>" + trailing blank.
+    let chars = "▶ > ".chars().count() + turn.prompt.chars().count();
+    let prompt_rows = chars.div_ceil(wrap_width.max(1)).max(1);
+    let mut h = prompt_rows + 1;
+    if turn.expanded {
+        h += turn
+            .details
+            .iter()
+            .map(|m| message_height(m, wrap_width))
+            .sum::<usize>();
+    }
+    h
+}
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let render_started = std::time::Instant::now();
