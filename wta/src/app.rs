@@ -3853,7 +3853,6 @@ impl App {
             Some(r) => r,
             None => return 0,
         };
-        // Compute actual total height based on real card content (accounts for wrapped code).
         let panel_width = self.terminal_cols;
         let total_needed: u16 = recs
             .choices
@@ -3861,9 +3860,23 @@ impl App {
             .map(|c| rec_card_height(c, panel_width) as u16)
             .sum::<u16>()
             .saturating_add(1); // hint line
-        // Leave at least 3 rows for chat + 3 for input.
-        let max = self.terminal_rows.saturating_sub(6).max(8);
-        total_needed.min(max).max(8)
+        // The recommended card must always be fully renderable: render_card
+        // bails when raw.height < 5 (Borders::ALL + 3-row inner layout), so a
+        // panel shorter than recommended_card_h + 1 hides every card and
+        // leaves only the hint visible — the very symptom we hit when the
+        // old `.max(8)` lower bound was too small for cards with wrapped
+        // content.
+        let rec_idx = crate::coordinator::recommended_choice_index(recs);
+        let recommended_card_h = recs
+            .choices
+            .get(rec_idx)
+            .map(|c| rec_card_height(c, panel_width) as u16)
+            .unwrap_or(7);
+        let min_panel = recommended_card_h.saturating_add(1); // + hint
+        // Cap so input (3) and chat (>=3) still have room; floor at the
+        // minimum the recommended card needs.
+        let max = self.terminal_rows.saturating_sub(6).max(min_panel);
+        total_needed.min(max).max(min_panel)
     }
 
     fn clear_recommendations(&mut self) {
@@ -4222,7 +4235,17 @@ impl App {
                 let recommended_choice = recommendations.recommended_choice;
                 let tab = self.session_tab_mut(session_id);
                 tab.stage_completed_turn(text, false);
+                // Commit immediately so chat history is never blank while the
+                // card is visible. chat::render reads completed_turns, not
+                // pending_completed_turn — leaving it pending makes the prompt
+                // + agent reply invisible until the user dismisses the card.
+                // Enter's later commit_pending_completed_turn becomes a no-op.
+                tab.commit_pending_completed_turn();
                 tab.selected_recommendation = rec_idx;
+                tab.selected_button = 0;
+                // Reset scroll so a leftover offset from a previous rec set
+                // doesn't skip every card (render bails when card.y+h <= rec_scroll).
+                tab.rec_scroll = 0;
                 tab.recommendations = Some(recommendations);
                 tab.selection_visible_pending = true;
                 // Drop any leftover completed-turn selection so Enter routes

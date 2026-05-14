@@ -32,7 +32,7 @@ const SHIMMER_BRIGHT_RGB: (u8, u8, u8) = (217, 217, 217);
 const ACTIVITY_PREVIEW_MAX_CHARS: usize = 180;
 const MAX_RENDER_LINE_CHARS: usize = 4096;
 
-pub fn render(frame: &mut Frame, app: &App, area: Rect) {
+pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let render_started = std::time::Instant::now();
     let inner = Block::default().borders(Borders::NONE);
     let inner_area = inner.inner(area);
@@ -51,22 +51,28 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let mut pending_lines = build_pending_stream_lines(app);
     reversed_lines.extend(pending_lines.drain(..).rev());
 
+    let mut truncated = false;
+
     for (idx, msg) in app.current_tab().messages.iter().enumerate().rev() {
         let is_last_message = idx + 1 == app.current_tab().messages.len();
         let mut message_lines = build_message_lines(msg, is_last_message, app.current_tab().agent_streaming, wrap_width);
         reversed_lines.extend(message_lines.drain(..).rev());
         if reversed_lines.len() >= requested_lines {
+            truncated = true;
             break;
         }
     }
 
-    let selected_idx = app.current_tab().selected_completed_turn_idx;
-    for (idx, turn) in app.current_tab().completed_turns.iter().enumerate().rev() {
-        let is_selected = selected_idx == Some(idx);
-        let mut turn_lines = build_completed_turn_lines(turn, is_selected, wrap_width);
-        reversed_lines.extend(turn_lines.drain(..).rev());
-        if reversed_lines.len() >= requested_lines {
-            break;
+    if !truncated {
+        let selected_idx = app.current_tab().selected_completed_turn_idx;
+        for (idx, turn) in app.current_tab().completed_turns.iter().enumerate().rev() {
+            let is_selected = selected_idx == Some(idx);
+            let mut turn_lines = build_completed_turn_lines(turn, is_selected, wrap_width);
+            reversed_lines.extend(turn_lines.drain(..).rev());
+            if reversed_lines.len() >= requested_lines {
+                truncated = true;
+                break;
+            }
         }
     }
 
@@ -81,6 +87,17 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
+
+    // Once both loops exhausted without hitting requested_lines, the history
+    // above is fully built — any scroll_offset past `total_lines - visible_height`
+    // is over the top. Clamp it so the user doesn't have to burn off the
+    // inflated value before scrolling down re-engages.
+    if !truncated {
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        if app.current_tab().scroll_offset > max_scroll {
+            app.current_tab_mut().scroll_offset = max_scroll;
+        }
+    }
 
     ui_trace::log_slow("chat_render", render_started.elapsed(), || {
         format!(

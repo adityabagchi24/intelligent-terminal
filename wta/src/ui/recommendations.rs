@@ -5,9 +5,10 @@ use crate::app::{rec_card_height, App};
 use crate::coordinator::{OpenTarget, RecommendationChoice, RecommendedAction};
 use crate::theme;
 
-pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(recs) = &app.current_tab().recommendations else {
-        return;
+pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    let recs = match app.current_tab().recommendations.clone() {
+        Some(r) => r,
+        None => return,
     };
     if area.width == 0 || area.height == 0 {
         return;
@@ -26,10 +27,33 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
+    // Clamp rec_scroll: the keyboard path (scroll_rec_to_selected) treats it
+    // as a relative offset from the panel top, but the skip check below was
+    // comparing it against absolute y. Reconcile here by clamping to a value
+    // that always keeps the last card visible so wheel scrolling can't hide
+    // every card.
+    let total_cards_h: usize = recs
+        .choices
+        .iter()
+        .map(|c| rec_card_height(c, area.width))
+        .sum();
+    let last_card_h = recs
+        .choices
+        .last()
+        .map(|c| rec_card_height(c, area.width))
+        .unwrap_or(0);
+    let max_rec_scroll = total_cards_h.saturating_sub(last_card_h);
+    if app.current_tab().rec_scroll > max_rec_scroll {
+        app.current_tab_mut().rec_scroll = max_rec_scroll;
+    }
     let rec_scroll = app.current_tab().rec_scroll;
+
+    let panel_top_y = area.y as usize;
     for (idx, choice) in recs.choices.iter().enumerate() {
         let raw = chunks[idx];
-        if (raw.y as usize + raw.height as usize) <= rec_scroll {
+        let card_top_rel = (raw.y as usize).saturating_sub(panel_top_y);
+        let card_bottom_rel = card_top_rel + raw.height as usize;
+        if card_bottom_rel <= rec_scroll {
             continue;
         }
         let card_area = Rect {
