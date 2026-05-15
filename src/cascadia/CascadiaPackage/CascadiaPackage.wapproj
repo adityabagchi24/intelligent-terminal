@@ -19,6 +19,7 @@
     <OCExecutionAliasName Condition="'$(OCExecutionAliasName)'==''">wt</OCExecutionAliasName>
     <!-- Map MSBuild Platform to Rust target triple for wta.exe inclusion. -->
     <WtaRustTarget Condition="'$(Platform)'=='x64'">x86_64-pc-windows-msvc</WtaRustTarget>
+    <WtaRustTarget Condition="'$(Platform)'=='x86'">i686-pc-windows-msvc</WtaRustTarget>
     <WtaRustTarget Condition="'$(Platform)'=='ARM64'">aarch64-pc-windows-msvc</WtaRustTarget>
     <!-- Pick the matching Cargo profile for the package configuration so a
          Debug F5 picks up `cargo build` output and a Release build picks up
