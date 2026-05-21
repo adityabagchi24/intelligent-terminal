@@ -197,6 +197,7 @@ winsta
 winstamin
 wmemcmp
 wpc
+wtcli
 WSF
 WWH
 wwinmain
