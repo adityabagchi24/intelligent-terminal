@@ -2616,7 +2616,18 @@ impl App {
         // the user file a useful report). The trailing `\x1b[0m`
         // reset guarantees any post-failure output isn't tinted /
         // blinking.
-        let cwd_string = s.cwd.to_string_lossy().to_string();
+        let raw_cwd_string = s.cwd.to_string_lossy().to_string();
+        // Drop stale cwd so wtcli falls back to the profile default
+        // rather than failing CreateProcessW with ERROR_DIRECTORY.
+        let valid_cwd = crate::cwd_util::validate_starting_directory(&s.cwd);
+        if valid_cwd.is_none() && !raw_cwd_string.is_empty() {
+            tracing::warn!(
+                target: "agents_view",
+                key = %key,
+                cwd = %raw_cwd_string,
+                "dispatch_resume: stored cwd is no longer a valid directory; falling back to profile default",
+            );
+        }
         let short_key: String = key.chars().take(8).collect();
         let launch_commandline = format!(
             "cmd /c echo \x1b[1;36;5mResuming {} session {}...\x1b[0m && {}",
@@ -2627,10 +2638,11 @@ impl App {
             "-c".to_string(),
             launch_commandline.clone(),
         ];
-        if !cwd_string.is_empty() {
+        if let Some(ref cwd) = valid_cwd {
             argv.push("-d".to_string());
-            argv.push(cwd_string.clone());
+            argv.push(cwd.clone());
         }
+        let cwd_string = valid_cwd.clone().unwrap_or_default();
 
         // Optimistic state flip: bump Historical/Ended -> Idle so a rapid
         // second Enter on the same row sees a non-terminal status and
@@ -2806,7 +2818,17 @@ impl App {
         }
 
         let key = s.key.clone();
-        let cwd_string = s.cwd.to_string_lossy().to_string();
+        let raw_cwd_string = s.cwd.to_string_lossy().to_string();
+        let valid_cwd = crate::cwd_util::validate_starting_directory(&s.cwd);
+        if valid_cwd.is_none() && !raw_cwd_string.is_empty() {
+            tracing::warn!(
+                target: "agents_view",
+                key = %key,
+                cwd = %raw_cwd_string,
+                "dispatch_resume_in_agent_pane: stored cwd is no longer a valid directory; omitting from resume_in_new_agent_tab event",
+            );
+        }
+        let cwd_string = valid_cwd.unwrap_or_default();
 
         // Mirror dispatch_resume's optimistic state flip so a rapid
         // double press doesn't double-dispatch.
@@ -2815,13 +2837,15 @@ impl App {
         self.publish_session_hook(resume_event);
         self.dispatch_session_resume_dispatched_rpc(&key);
 
+        let mut params = serde_json::Map::new();
+        params.insert("session_id".to_string(), serde_json::Value::String(key.clone()));
+        if !cwd_string.is_empty() {
+            params.insert("cwd".to_string(), serde_json::Value::String(cwd_string.clone()));
+        }
         let evt = serde_json::json!({
             "type": "event",
             "method": "resume_in_new_agent_tab",
-            "params": {
-                "session_id": key,
-                "cwd": cwd_string,
-            }
+            "params": params,
         });
         send_wt_protocol_event(evt.to_string());
 
@@ -2834,16 +2858,19 @@ impl App {
 
         #[cfg(test)]
         {
+            let mut argv = vec![
+                "resume_in_new_agent_tab".to_string(),
+                "--session-id".to_string(),
+                s.key.clone(),
+            ];
+            if !cwd_string.is_empty() {
+                argv.push("--cwd".to_string());
+                argv.push(cwd_string);
+            }
             self.last_dispatched_command = Some(DispatchedCommand {
                 kind: DispatchedCommandKind::ResumeInAgentPane,
                 session_id: Some(s.key.clone()),
-                argv: vec![
-                    "resume_in_new_agent_tab".to_string(),
-                    "--session-id".to_string(),
-                    s.key.clone(),
-                    "--cwd".to_string(),
-                    cwd_string,
-                ],
+                argv,
             });
         }
     }
@@ -10100,13 +10127,18 @@ mod tests {
     fn enter_on_history_row_dispatches_new_tab_with_resume() {
         use crate::agent_sessions::{CliSource, SessionEvent};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use std::path::PathBuf;
+        // Use a real existing directory so cwd_util::validate_starting_directory
+        // accepts it. A missing path would (correctly) be dropped from
+        // the argv — that behaviour is covered by
+        // `enter_on_history_row_with_missing_cwd_omits_d_flag` below.
+        let real_cwd = std::env::temp_dir();
+        let real_cwd_str = real_cwd.to_string_lossy().to_string();
         let mut app = test_app();
         app.agent_sessions.apply(SessionEvent::SessionStarted {
             key: "abc-123".into(),
             cli_source: CliSource::Claude,
             pane_session_id: "p".into(),
-            cwd: PathBuf::from("/work/proj"),
+            cwd: real_cwd.clone(),
             title: "t".into(),
         });
         app.agent_sessions.apply(SessionEvent::SessionStopped {
@@ -10159,9 +10191,69 @@ mod tests {
         // Resume is keyed off the session's project cwd — the new tab's
         // primary pane must start in that directory so the CLI's session
         // store lookup (`~/.claude/projects/<encoded-cwd>/...`) succeeds.
+        let expected = format!("-d {}", real_cwd_str);
         assert!(
-            argv.contains("-d /work/proj"),
-            "expected -d <cwd>; argv: {}",
+            argv.contains(&expected),
+            "expected `{}` in argv: {}",
+            expected,
+            argv
+        );
+    }
+
+    /// When the stored cwd no longer exists on disk (e.g. user deleted
+    /// the project), `dispatch_resume` must omit `-d <cwd>` entirely so
+    /// wtcli falls back to the profile's startingDirectory. Without
+    /// this guard, `CreateProcessW` would fail with `ERROR_DIRECTORY`
+    /// and produce a visibly-broken pane.
+    #[test]
+    fn enter_on_history_row_with_missing_cwd_omits_d_flag() {
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::path::PathBuf;
+        let missing = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "wta-missing-cwd-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            p
+        };
+        assert!(!missing.exists());
+        let mut app = test_app();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "abc-stale".into(),
+            cli_source: CliSource::Claude,
+            pane_session_id: "p".into(),
+            cwd: PathBuf::from(&missing),
+            title: "t".into(),
+        });
+        app.agent_sessions.apply(SessionEvent::SessionStopped {
+            key: "abc-stale".into(),
+            reason: "user_exit".into(),
+        });
+        app.current_tab_mut().current_view = View::Agents;
+        app.current_tab_mut().agents_list_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let cmd = app
+            .last_dispatched_command_for_test()
+            .expect("a command was dispatched");
+        assert_eq!(cmd.kind, DispatchedCommandKind::NewTabResume);
+        let argv = cmd.argv.join(" ");
+        assert!(argv.contains("new-tab"), "argv: {}", argv);
+        // The stale cwd must NOT have leaked through as `-d`.
+        assert!(
+            !argv.contains("-d "),
+            "argv must omit -d when cwd is missing: {}",
+            argv
+        );
+        assert!(
+            !argv.contains(&missing.to_string_lossy().to_string()),
+            "argv must not embed the stale cwd: {}",
             argv
         );
     }
@@ -10176,7 +10268,11 @@ mod tests {
         // regression-checked.
         use crate::agent_sessions::{CliSource, SessionEvent};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use std::path::PathBuf;
+        // Use a real existing directory so cwd_util::validate_starting_directory
+        // accepts it. A missing cwd would (correctly) be omitted —
+        // covered by `shift_enter_on_history_row_with_missing_cwd_omits_cwd`.
+        let real_cwd = std::env::temp_dir();
+        let real_cwd_str = real_cwd.to_string_lossy().to_string();
         let mut app = test_app();
         // Capability gate: dispatch is only attempted when the agent
         // advertised loadSession. Without this, the handler
@@ -10186,7 +10282,7 @@ mod tests {
             key: "abc-123".into(),
             cli_source: CliSource::Claude,
             pane_session_id: "p".into(),
-            cwd: PathBuf::from("/work/proj"),
+            cwd: real_cwd.clone(),
             title: "t".into(),
         });
         app.agent_sessions.apply(SessionEvent::SessionStopped {
@@ -10206,7 +10302,76 @@ mod tests {
         let argv = cmd.argv.join(" ");
         assert!(argv.contains("resume_in_new_agent_tab"), "argv: {}", argv);
         assert!(argv.contains("--session-id abc-123"), "argv: {}", argv);
-        assert!(argv.contains("--cwd /work/proj"), "argv: {}", argv);
+        let expected = format!("--cwd {}", real_cwd_str);
+        assert!(
+            argv.contains(&expected),
+            "expected `{}` in argv: {}",
+            expected,
+            argv
+        );
+    }
+
+    /// Shift+Enter mirror of `enter_on_history_row_with_missing_cwd_omits_d_flag`:
+    /// when the stored cwd no longer exists, the resume-in-agent-pane
+    /// path must omit the `cwd` field from the emitted
+    /// `resume_in_new_agent_tab` event so WT's `_OpenNewTab` falls back
+    /// to the profile's startingDirectory (otherwise the new tab opens
+    /// with a broken connection).
+    #[test]
+    fn shift_enter_on_history_row_with_missing_cwd_omits_cwd() {
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::path::PathBuf;
+        let missing = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "wta-missing-shift-cwd-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            p
+        };
+        assert!(!missing.exists());
+        let mut app = test_app();
+        app.agent_supports_load_session = true;
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "abc-stale".into(),
+            cli_source: CliSource::Claude,
+            pane_session_id: "p".into(),
+            cwd: PathBuf::from(&missing),
+            title: "t".into(),
+        });
+        app.agent_sessions.apply(SessionEvent::SessionStopped {
+            key: "abc-stale".into(),
+            reason: "user_exit".into(),
+        });
+        app.current_tab_mut().current_view = View::Agents;
+        app.current_tab_mut().agents_list_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        let cmd = app
+            .last_dispatched_command_for_test()
+            .expect("a command was dispatched");
+        assert_eq!(cmd.kind, DispatchedCommandKind::ResumeInAgentPane);
+        let argv = cmd.argv.join(" ");
+        assert!(argv.contains("resume_in_new_agent_tab"), "argv: {}", argv);
+        // Fallback contract: the --cwd flag (and any value) must be
+        // omitted entirely so the consumer uses its default. A
+        // regression that sent `--cwd ""` would slip past a
+        // string-contains check, hence the explicit flag assertion.
+        assert!(
+            !cmd.argv.iter().any(|a| a == "--cwd"),
+            "argv must omit --cwd when cwd is missing: {:?}",
+            cmd.argv
+        );
+        assert!(
+            !argv.contains(&missing.to_string_lossy().to_string()),
+            "argv must not embed the stale cwd: {}",
+            argv
+        );
     }
 
     #[test]
